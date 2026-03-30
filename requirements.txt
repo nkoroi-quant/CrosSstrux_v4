@@ -11,25 +11,23 @@ python-multipart>=0.0.6
 pandas>=2.1.0
 numpy>=1.26.0
 scipy>=1.11.0
+pyarrow>=17.0.0
 
-# Caching & Rate Limiting
+# Caching & Rate Limiting (REQUIRED to suppress Redis warning)
 redis>=5.0.0
-# Fallback: aiocache>=0.12.0  # Optional memory cache alternative
 
-# ML/Analytics (for model training)
+# ML/Analytics
 scikit-learn>=1.3.0
-# histgradientboosting is part of sklearn >= 1.0
 
 # Utilities
 python-dotenv>=1.0.0
-httpx>=0.25.0  # Async HTTP client
+httpx>=0.25.0
+python-dateutil>=2.9.0
+pytz>=2024.2
 
-# Monitoring & Logging
-# prometheus-client>=0.19.0  # Optional metrics
-# sentry-sdk>=1.39.0  # Optional error tracking
+# Monitoring (optional but recommended)
+prometheus-client>=0.20.0
+sentry-sdk>=2.14.0
 
-# Development (optional)
-# pytest>=7.4.0
-# pytest-asyncio>=0.21.0
-# black>=23.0.0
-# mypy>=1.7.0
+# MetaTrader5 (optional, only if running MT5 locally)
+MetaTrader5>=5.0.45

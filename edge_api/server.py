@@ -9,6 +9,11 @@ Production-ready FastAPI server with:
 - Health check and metrics endpoints
 """
 
+# Add this import at the top
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+
 import os
 import time
 import json
@@ -42,10 +47,12 @@ except ImportError:
     logger.warning("Redis not available, using memory-based caching")
 
 # Import CrosSstrux modules
+
+
 try:
     from core.asset_profiles import ASSET_PROFILES, get_profile, AssetClass
-    from features.synthetic_volume import add_synthetic_volume
-    from features.hierarchical_fusion import fuse_timeframe_features
+    from core.features.synthetic_volume import add_synthetic_volume
+    from core.features.hierarchical_fusion import fuse_timeframe_features
     FEATURES_AVAILABLE = True
 except ImportError:
     FEATURES_AVAILABLE = False
@@ -595,6 +602,17 @@ app = FastAPI(
     version="4.1.0",
     lifespan=lifespan
 )
+
+# Add this exception handler after app creation
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.error(f"Validation error: {exc.errors()}")
+    logger.error(f"Request body: {await request.body()}")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()}
+    )
+
 
 # Middleware
 app.add_middleware(GZipMiddleware, minimum_size=1000)

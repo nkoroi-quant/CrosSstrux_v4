@@ -1,46 +1,44 @@
 //+------------------------------------------------------------------+
-//| HashDiggr.mq5 - BTCUSD Expert Advisor v4.1.0                      |
+//| HashDiggr_Fixed.mq5 - BTCUSD Expert Advisor v4.2               |
 //+------------------------------------------------------------------+
-//| Description: Cryptocurrency trading EA with asset-aware spread   |
-//|              normalization, adaptive API caching, and synthetic  |
-//|              volume handling. Production-ready for BTCUSD CFDs.    |
+//| Description: Fixed version with proper JSON handling for FastAPI |
 //+------------------------------------------------------------------+
 #property copyright "CrosSstrux v4.1"
 #property link      "https://github.com/nkoroi-quant/CrosSstrux_v4"
-#property version   "4.1"
+#property version   "4.2"
 #property strict
 
 #include <Trade\Trade.mqh>
-#include <JAson.mqh>  // JSON library
+#include <JAson.mqh>
 #include "Include/AssetProfile.mqh"
 #include "Include/SpreadManager.mqh"
 #include "Include/ContextRefreshManager.mqh"
 
 //--- Input Parameters
 input group "=== API Configuration ==="
-input string InpApiUrl = "http://localhost:8000/analyze";
+input string InpApiUrl = "http://127.0.0.1:8000/analyze";
 input string InpApiKey = "";
 input int    InpApiTimeoutMs = 5000;
 
 input group "=== Risk Management ==="
-input double InpRiskPercent = 1.0;           // Risk per trade (%)
-input double InpMaxDailyRisk = 3.0;          // Max daily risk (%)
-input int    InpMaxPositions = 5;            // Max concurrent positions
+input double InpRiskPercent = 1.0;
+input double InpMaxDailyRisk = 3.0;
+input int    InpMaxPositions = 5;
 input bool   InpUseEquityCurveProtection = true;
 
 input group "=== Entry Parameters ==="
-input double InpMinSignalConfidence = 0.65;  // Minimum signal confidence
+input double InpMinSignalConfidence = 0.65;
 input bool   InpRequireTrendAlignment = true;
-input int    InpMaxPyramidTrades = 5;        // Override profile default
+input int    InpMaxPyramidTrades = 5;
 
 input group "=== Pyramiding ==="
 input bool   InpEnablePyramiding = true;
-input double InpPyramidDistanceATR = 0.3;    // ATR multiplier
-input double InpPyramidLotMultiplier = 0.8;  // Reduce size on adds
+input double InpPyramidDistanceATR = 0.3;
+input double InpPyramidLotMultiplier = 0.8;
 
 input group "=== Logging ==="
 input bool   InpVerboseLogging = true;
-input int    InpLogFrequency = 10;           // Log every N ticks
+input int    InpLogFrequency = 10;
 
 //--- Global Objects
 CTrade      g_trade;
@@ -54,19 +52,16 @@ struct TradingState
    string symbol;
    AssetProfile profile;
    
-   // API Data Cache
    string lastApiResponse;
    datetime lastContextUpdate;
    datetime lastSignalUpdate;
    
-   // Signal Data
-   double signalDirection;       // -1, 0, 1
-   double signalConfidence;      // 0.0 - 1.0
-   double entryPrecision;        // 0.0 - 1.0
-   string volatilityRegime;      // LOW, NORMAL, HIGH, BREAKOUT
-   double trendAlignment;        // 0.0 - 1.0
+   double signalDirection;
+   double signalConfidence;
+   double entryPrecision;
+   string volatilityRegime;
+   double trendAlignment;
    
-   // Position Tracking
    int openPositions;
    double totalLots;
    double avgEntryPrice;
@@ -74,7 +69,6 @@ struct TradingState
    datetime lastTradeTime;
    int pyramidCount;
    
-   // Daily Tracking
    double dailyPnL;
    int dailyTrades;
    datetime tradingDay;
@@ -103,65 +97,51 @@ struct TradingState
 };
 
 TradingState g_state;
-
-//--- Metrics
 int g_tickCount = 0;
 datetime g_startTime = 0;
 
 //+------------------------------------------------------------------+
-//| Expert initialization function                                   |
-//+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("=== HashDiggr v4.1.0 Initializing ===");
+   Print("=== HashDiggr v4.1.1 (FIXED) Initializing ===");
    
-   // Set symbol
    g_state.symbol = Symbol();
    
-   // Initialize profile registry (auto-loads defaults)
-   
-   // Initialize spread manager
    if(!g_spreadManager.Initialize(g_state.symbol))
    {
       Print("ERROR: Failed to initialize SpreadManager");
       return INIT_FAILED;
    }
    
-   // Get asset profile
    if(!g_profileRegistry.GetProfile(g_state.symbol, g_state.profile))
    {
       Print("WARNING: Using default profile for ", g_state.symbol);
    }
    
-   // Initialize refresh manager
    if(!g_refreshManager.Initialize(g_state.symbol, &g_spreadManager))
    {
       Print("ERROR: Failed to initialize ContextRefreshManager");
       return INIT_FAILED;
    }
    
-   // Setup trading
-   g_trade.SetExpertMagicNumber(42001);  // HashDiggr magic
-   g_trade.SetDeviationInPoints(50);     // Slippage tolerance
+   g_trade.SetExpertMagicNumber(42001);
+   g_trade.SetDeviationInPoints(50);
    g_trade.SetTypeFilling(ORDER_FILLING_IOC);
    g_trade.SetAsyncMode(false);
    
-   // Log profile details
    g_profileRegistry.LogProfileDetails(g_state.symbol);
    g_spreadManager.LogSpreadStatus();
    
-   // Initialize state
    g_startTime = TimeCurrent();
    g_state.tradingDay = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
    
    Print("HashDiggr initialized successfully for ", g_state.symbol);
    Print("Asset Class: ", g_profileRegistry.AssetClassToString(g_state.profile.assetClass));
+   Print("API Endpoint: ", InpApiUrl);
    
    return(INIT_SUCCEEDED);
 }
 
-//+------------------------------------------------------------------+
-//| Expert deinitialization function                                 |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
@@ -172,26 +152,19 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
-//| Expert tick function                                             |
-//+------------------------------------------------------------------+
 void OnTick()
 {
    g_tickCount++;
    
-   // Periodic logging
    if(InpVerboseLogging && g_tickCount % InpLogFrequency == 0)
    {
       g_spreadManager.UpdateStatistics();
       g_spreadManager.LogSpreadStatus();
    }
    
-   // Update position tracking
    UpdatePositionState();
-   
-   // Check daily reset
    CheckDailyReset();
    
-   // Check equity protection
    if(InpUseEquityCurveProtection && CheckEquityProtection())
    {
       if(g_tickCount % 100 == 0)
@@ -199,7 +172,6 @@ void OnTick()
       return;
    }
    
-   // Check spread
    g_spreadManager.UpdateStatistics();
    if(!g_spreadManager.IsSpreadAcceptable())
    {
@@ -208,62 +180,62 @@ void OnTick()
       return;
    }
    
-   // Update adaptive intervals
    g_refreshManager.UpdateAdaptiveIntervals();
    
-   // Refresh context if needed
    if(g_refreshManager.ShouldRefreshContext())
    {
       if(g_refreshManager.ShouldCallAPI())
-      {
          RefreshContextFromAPI();
-      }
    }
    
-   // Refresh signal if needed
    if(g_refreshManager.ShouldRefreshSignal())
    {
       if(g_refreshManager.ShouldCallAPI())
-      {
          RefreshSignalFromAPI();
-      }
    }
    
-   // Execute trading logic
    ExecuteTradingLogic();
-   
-   // Manage open positions
    ManageOpenPositions();
 }
 
 //+------------------------------------------------------------------+
-//| Refresh Context from API                                           |
+//| FIXED: Refresh Context from API with null-byte fix                 |
 //+------------------------------------------------------------------+
 void RefreshContextFromAPI()
 {
-   // Build multi-timeframe request
    string jsonRequest = BuildAnalysisRequest();
    
-   string headers;
-   StringAdd(headers, "Content-Type: application/json\\r\\n");
-   if(StringLen(InpApiKey) > 0)
+   if(StringLen(jsonRequest) == 0)
    {
-      StringAdd(headers, "Authorization: Bearer " + InpApiKey + "\\r\\n");
+      Print("ERROR: Empty JSON request, skipping API call");
+      g_refreshManager.RecordApiFailure("Empty request data");
+      return;
    }
+   
+   string headers;
+   StringAdd(headers, "Content-Type: application/json\r\n");
+   if(StringLen(InpApiKey) > 0)
+      StringAdd(headers, "Authorization: Bearer " + InpApiKey + "\r\n");
    
    char data[], result[];
    string url = InpApiUrl;
    int res;
    
-   StringToCharArray(jsonRequest, data);
+   // Convert to char array
+   int strLen = StringToCharArray(jsonRequest, data);
+   
+   // === CRITICAL FIX: Remove null terminator ===
+   if(strLen > 0)
+      ArrayResize(data, strLen);
    
    datetime callStart = TimeLocal();
    res = WebRequest("POST", url, headers, InpApiTimeoutMs, data, result, headers);
-   double responseTime = (double)(TimeLocal() - callStart);
    
    if(res != 200)
    {
       Print("API Error: HTTP ", res);
+      if(res == 422)
+         Print("JSON Sent: ", jsonRequest);
       g_refreshManager.RecordApiFailure("HTTP " + IntegerToString(res));
       return;
    }
@@ -271,7 +243,6 @@ void RefreshContextFromAPI()
    string response = CharArrayToString(result);
    g_state.lastApiResponse = response;
    
-   // Parse response
    CJAVal json;
    if(!json.Deserialize(response))
    {
@@ -280,11 +251,10 @@ void RefreshContextFromAPI()
       return;
    }
    
-   // Extract context data
    g_state.volatilityRegime = json["regime"].ToStr();
    g_state.trendAlignment = json["trend_alignment"].ToDbl();
    
-   g_refreshManager.RecordApiSuccess(responseTime);
+   g_refreshManager.RecordApiSuccess((double)(TimeLocal() - callStart));
    g_state.lastContextUpdate = TimeCurrent();
    
    if(InpVerboseLogging)
@@ -295,18 +265,14 @@ void RefreshContextFromAPI()
 }
 
 //+------------------------------------------------------------------+
-//| Refresh Signal from API                                            |
-//+------------------------------------------------------------------+
 void RefreshSignalFromAPI()
 {
-   // Use cached context if available
    if(StringLen(g_state.lastApiResponse) == 0)
    {
       RefreshContextFromAPI();
       return;
    }
    
-   // Parse cached response for signal
    CJAVal json;
    if(!json.Deserialize(g_state.lastApiResponse))
    {
@@ -314,7 +280,6 @@ void RefreshSignalFromAPI()
       return;
    }
    
-   // Extract signal
    string signal = json["signal"].ToStr();
    g_state.signalConfidence = json["confidence"].ToDbl();
    g_state.entryPrecision = json["entry_precision"].ToDbl();
@@ -336,83 +301,84 @@ void RefreshSignalFromAPI()
 }
 
 //+------------------------------------------------------------------+
-//| Build Analysis Request                                             |
+//| FIXED: Build Analysis Request with validation                      |
 //+------------------------------------------------------------------+
 string BuildAnalysisRequest(void)
 {
-   // Gather multi-timeframe data
    MqlRates ratesM1[], ratesM5[], ratesM15[], ratesH1[], ratesD1[];
+   
    ArraySetAsSeries(ratesM1, true);
    ArraySetAsSeries(ratesM5, true);
    ArraySetAsSeries(ratesM15, true);
    ArraySetAsSeries(ratesH1, true);
    ArraySetAsSeries(ratesD1, true);
 
-   CopyRates(g_state.symbol, PERIOD_M1, 0, 100, ratesM1);
-   CopyRates(g_state.symbol, PERIOD_M5, 0, 100, ratesM5);
-   CopyRates(g_state.symbol, PERIOD_M15, 0, 50, ratesM15);
-   CopyRates(g_state.symbol, PERIOD_H1, 0, 50, ratesH1);
-   CopyRates(g_state.symbol, PERIOD_D1, 0, 20, ratesD1);
+   int copied1 = CopyRates(g_state.symbol, PERIOD_M1, 0, 10, ratesM1);
+   int copied5 = CopyRates(g_state.symbol, PERIOD_M5, 0, 10, ratesM5);
+   int copied15 = CopyRates(g_state.symbol, PERIOD_M15, 0, 10, ratesM15);
+   int copiedH1 = CopyRates(g_state.symbol, PERIOD_H1, 0, 10, ratesH1);
+   int copiedD1 = CopyRates(g_state.symbol, PERIOD_D1, 0, 10, ratesD1);
+   
+   if(copied1 <= 0 || copied5 <= 0 || copied15 <= 0 || copiedH1 <= 0 || copiedD1 <= 0)
+   {
+      Print("ERROR: Failed to copy rates. M1:", copied1, " M5:", copied5);
+      return "";
+   }
 
-   // Build JSON with proper escaping
    string json = "{";
    json += "\"symbol\": \"" + g_state.symbol + "\",";
    json += "\"asset_class\": \"cryptocurrency\",";
    json += "\"timeframes\": {";
 
-   // Add M1 data
+   // M1
    json += "\"M1\": {";
    json += "\"open\": " + DoubleToString(ratesM1[0].open, g_state.profile.digits) + ",";
    json += "\"high\": " + DoubleToString(ratesM1[0].high, g_state.profile.digits) + ",";
    json += "\"low\": " + DoubleToString(ratesM1[0].low, g_state.profile.digits) + ",";
    json += "\"close\": " + DoubleToString(ratesM1[0].close, g_state.profile.digits) + ",";
-   json += "\"tick_volume\": " + IntegerToString(ratesM1[0].tick_volume) + ",";
-   json += "\"real_volume\": " + IntegerToString(ratesM1[0].real_volume);
+   json += "\"tick_volume\": " + IntegerToString((int)ratesM1[0].tick_volume) + ",";
+   json += "\"real_volume\": " + IntegerToString((int)ratesM1[0].real_volume);
    json += "},";
 
-   // Add M5 data
+   // M5
    json += "\"M5\": {";
    json += "\"close\": " + DoubleToString(ratesM5[0].close, g_state.profile.digits) + ",";
    json += "\"atr\": " + DoubleToString(CalculateATR(PERIOD_M5, 14), g_state.profile.digits);
    json += "},";
 
-   // Add M15 data
+   // M15
    json += "\"M15\": {";
    json += "\"close\": " + DoubleToString(ratesM15[0].close, g_state.profile.digits) + ",";
    json += "\"ema20\": " + DoubleToString(CalculateEMA(PERIOD_M15, 20), g_state.profile.digits);
    json += "},";
 
-   // Add H1 data
+   // H1
    json += "\"H1\": {";
    json += "\"close\": " + DoubleToString(ratesH1[0].close, g_state.profile.digits) + ",";
    json += "\"ema50\": " + DoubleToString(CalculateEMA(PERIOD_H1, 50), g_state.profile.digits);
    json += "},";
 
-   // Add D1 data
+   // D1
    json += "\"D1\": {";
    json += "\"close\": " + DoubleToString(ratesD1[0].close, g_state.profile.digits) + ",";
    json += "\"atr\": " + DoubleToString(CalculateATR(PERIOD_D1, 14), g_state.profile.digits);
    json += "}";
 
-   json += "},"; // close timeframes
+   json += "},";
    json += "\"account\": {";
    json += "\"balance\": " + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + ",";
    json += "\"equity\": " + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2);
    json += "},";
-
+   
    json += "\"spread_pips\": " + DoubleToString(g_spreadManager.GetSpreadPips(), 1);
    json += "}";
 
    return json;
 }
 
-
-//+------------------------------------------------------------------+
-//| Execute Trading Logic                                              |
 //+------------------------------------------------------------------+
 void ExecuteTradingLogic(void)
 {
-   // Check minimum conditions
    if(g_state.signalConfidence < InpMinSignalConfidence)
       return;
    
@@ -422,35 +388,24 @@ void ExecuteTradingLogic(void)
    if(InpRequireTrendAlignment && g_state.trendAlignment < 0.6)
       return;
    
-   // Check position limits
    if(g_state.openPositions >= InpMaxPositions)
       return;
    
-   // Check daily trade limit
-   if(g_state.dailyTrades >= 20)  // Max 20 trades per day
+   if(g_state.dailyTrades >= 20)
       return;
    
-   // Check pyramid limits
    if(g_state.openPositions > 0 && g_state.pyramidCount >= g_state.profile.pyramidMaxTrades)
       return;
    
-   // Execute based on signal
    if(g_state.signalDirection == 1 && CanOpenLong())
-   {
       OpenPosition(ORDER_TYPE_BUY);
-   }
    else if(g_state.signalDirection == -1 && CanOpenShort())
-   {
       OpenPosition(ORDER_TYPE_SELL);
-   }
 }
 
 //+------------------------------------------------------------------+
-//| Open Position                                                      |
-//+------------------------------------------------------------------+
 void OpenPosition(ENUM_ORDER_TYPE orderType)
 {
-   // Calculate lot size
    double lots = CalculateLotSize();
    if(lots <= 0)
    {
@@ -458,7 +413,6 @@ void OpenPosition(ENUM_ORDER_TYPE orderType)
       return;
    }
    
-   // Calculate SL/TP
    double atr = CalculateATR(PERIOD_M5, 14);
    double slDistance = atr * g_state.profile.slMultiplier;
    double tpDistance = atr * g_state.profile.tpMultiplier;
@@ -474,12 +428,10 @@ void OpenPosition(ENUM_ORDER_TYPE orderType)
    double sl = (orderType == ORDER_TYPE_BUY) ? price - slDistance : price + slDistance;
    double tp = (orderType == ORDER_TYPE_BUY) ? price + tpDistance : price - tpDistance;
    
-   // Normalize prices
    double tickSize = SymbolInfoDouble(g_state.symbol, SYMBOL_TRADE_TICK_SIZE);
    sl = NormalizeDouble(MathRound(sl / tickSize) * tickSize, g_state.profile.digits);
    tp = NormalizeDouble(MathRound(tp / tickSize) * tickSize, g_state.profile.digits);
    
-   // Execute
    bool success = false;
    if(orderType == ORDER_TYPE_BUY)
       success = g_trade.Buy(lots, g_state.symbol, price, sl, tp);
@@ -507,20 +459,14 @@ void OpenPosition(ENUM_ORDER_TYPE orderType)
 }
 
 //+------------------------------------------------------------------+
-//| Calculate Lot Size                                                 |
-//+------------------------------------------------------------------+
 double CalculateLotSize(void)
 {
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double riskAmount = balance * InpRiskPercent / 100.0;
    
-   // Adjust for pyramiding
    if(g_state.openPositions > 0)
-   {
       riskAmount *= InpPyramidLotMultiplier;
-   }
    
-   // Calculate based on ATR
    double atr = CalculateATR(PERIOD_M5, 14);
    double slDistance = atr * g_state.profile.slMultiplier;
    
@@ -535,7 +481,6 @@ double CalculateLotSize(void)
    
    double lots = riskAmount / (slDistance * tickValue / tickSize);
    
-   // Normalize to lot step
    double lotStep = SymbolInfoDouble(g_state.symbol, SYMBOL_VOLUME_STEP);
    double minLot = SymbolInfoDouble(g_state.symbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(g_state.symbol, SYMBOL_VOLUME_MAX);
@@ -547,11 +492,8 @@ double CalculateLotSize(void)
 }
 
 //+------------------------------------------------------------------+
-//| Manage Open Positions                                              |
-//+------------------------------------------------------------------+
 void ManageOpenPositions(void)
 {
-   // Trailing stop logic
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(PositionGetSymbol(i) != g_state.symbol)
@@ -569,7 +511,7 @@ void ManageOpenPositions(void)
       SymbolInfoTick(g_state.symbol, tick);
       
       double atr = CalculateATR(PERIOD_M5, 14);
-      double trailDistance = atr * 1.5;  // Trail at 1.5x ATR
+      double trailDistance = atr * 1.5;
       
       double newSL = currentSL;
       
@@ -577,31 +519,24 @@ void ManageOpenPositions(void)
       {
          double potentialSL = tick.bid - trailDistance;
          if(potentialSL > openPrice && potentialSL > currentSL)
-         {
             newSL = potentialSL;
-         }
       }
       else
       {
          double potentialSL = tick.ask + trailDistance;
          if(potentialSL < openPrice && potentialSL < currentSL)
-         {
             newSL = potentialSL;
-         }
       }
       
       if(newSL != currentSL)
       {
          double tickSize = SymbolInfoDouble(g_state.symbol, SYMBOL_TRADE_TICK_SIZE);
          newSL = NormalizeDouble(MathRound(newSL / tickSize) * tickSize, g_state.profile.digits);
-         
          g_trade.PositionModify(PositionGetInteger(POSITION_TICKET), newSL, currentTP);
       }
    }
 }
 
-//+------------------------------------------------------------------+
-//| Update Position State                                              |
 //+------------------------------------------------------------------+
 void UpdatePositionState(void)
 {
@@ -628,9 +563,7 @@ void UpdatePositionState(void)
    }
    
    if(g_state.totalLots > 0)
-   {
       g_state.avgEntryPrice = totalWeightedPrice / g_state.totalLots;
-   }
    else
    {
       g_state.avgEntryPrice = 0;
@@ -638,8 +571,6 @@ void UpdatePositionState(void)
    }
 }
 
-//+------------------------------------------------------------------+
-//| Check Daily Reset                                                  |
 //+------------------------------------------------------------------+
 void CheckDailyReset(void)
 {
@@ -658,59 +589,43 @@ void CheckDailyReset(void)
 }
 
 //+------------------------------------------------------------------+
-//| Check Equity Protection                                            |
-//+------------------------------------------------------------------+
 bool CheckEquityProtection(void)
 {
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double dailyRisk = InpMaxDailyRisk / 100.0;
    
-   // Check daily drawdown
-   if(equity < balance * (1 - dailyRisk))
-   {
-      return true;  // Protection triggered
-   }
+   if(equity < balance * (1 - InpMaxDailyRisk / 100.0))
+      return true;
    
    return false;
 }
 
 //+------------------------------------------------------------------+
-//| Can Open Long                                                      |
-//+------------------------------------------------------------------+
 bool CanOpenLong(void)
 {
-   // Check for existing shorts
    for(int i = 0; i < PositionsTotal(); i++)
    {
       if(PositionGetSymbol(i) != g_state.symbol) continue;
       if(PositionGetInteger(POSITION_MAGIC) != 42001) continue;
       if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
-         return false;  // No hedging
+         return false;
    }
-   
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| Can Open Short                                                     |
-//+------------------------------------------------------------------+
 bool CanOpenShort(void)
 {
-   // Check for existing longs
    for(int i = 0; i < PositionsTotal(); i++)
    {
       if(PositionGetSymbol(i) != g_state.symbol) continue;
       if(PositionGetInteger(POSITION_MAGIC) != 42001) continue;
       if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-         return false;  // No hedging
+         return false;
    }
-   
    return true;
 }
 
-//+------------------------------------------------------------------+
-//| Calculate ATR                                                      |
 //+------------------------------------------------------------------+
 double CalculateATR(ENUM_TIMEFRAMES tf, int period)
 {
@@ -732,8 +647,6 @@ double CalculateATR(ENUM_TIMEFRAMES tf, int period)
 }
 
 //+------------------------------------------------------------------+
-//| Calculate EMA                                                      |
-//+------------------------------------------------------------------+
 double CalculateEMA(ENUM_TIMEFRAMES tf, int period)
 {
    int handle = iMA(g_state.symbol, tf, period, 0, MODE_EMA, PRICE_CLOSE);
@@ -752,3 +665,4 @@ double CalculateEMA(ENUM_TIMEFRAMES tf, int period)
    IndicatorRelease(handle);
    return ema[0];
 }
+//+------------------------------------------------------------------+

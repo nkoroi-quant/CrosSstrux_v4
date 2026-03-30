@@ -1,12 +1,11 @@
 ﻿//+------------------------------------------------------------------+
-//| GoldDiggr_v4_1_Update.mq5 - XAUUSD Expert Advisor v4.1.0        |
+//| GoldDiggr_v4_1_Fixed.mq5 - XAUUSD Expert Advisor v4.2         |
 //+------------------------------------------------------------------+
-//| Description: Updated Gold EA with asset-aware spread handling,   |
-//|              adaptive caching, and improved multi-timeframe logic. |
+//| Description: Fixed version with proper JSON handling for FastAPI |
 //+------------------------------------------------------------------+
-#property copyright "CrosSstrux v4.1.0"
+#property copyright "CrosSstrux v4.1"
 #property link      "https://github.com/nkoroi-quant/CrosSstrux_v4"
-#property version   "4.1.0"
+#property version   "4.2"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -17,7 +16,7 @@
 
 //--- Input Parameters
 input group "=== API Configuration ==="
-input string InpApiUrl = "http://localhost:8000/analyze";
+input string InpApiUrl = "http://127.0.0.1:8000/analyze";
 input string InpApiKey = "";
 input int    InpApiTimeoutMs = 5000;
 
@@ -108,7 +107,7 @@ datetime g_startTime = 0;
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("=== GoldDiggr v4.1.0 Initializing ===");
+   Print("=== GoldDiggr v4.1.1 (FIXED) Initializing ===");
    
    g_state.symbol = Symbol();
    
@@ -141,6 +140,7 @@ int OnInit()
    g_state.tradingDay = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
    
    Print("GoldDiggr initialized successfully for ", g_state.symbol);
+   Print("API Endpoint: ", InpApiUrl);
    
    return(INIT_SUCCEEDED);
 }
@@ -182,28 +182,21 @@ void OnTick()
       return;
    }
    
-   // Session filter
    if(InpUseSessionFilter && !IsTradeSessionValid())
-   {
       return;
-   }
    
    g_refreshManager.UpdateAdaptiveIntervals();
    
    if(g_refreshManager.ShouldRefreshContext())
    {
       if(g_refreshManager.ShouldCallAPI())
-      {
          RefreshContextFromAPI();
-      }
    }
    
    if(g_refreshManager.ShouldRefreshSignal())
    {
       if(g_refreshManager.ShouldCallAPI())
-      {
          RefreshSignalFromAPI();
-      }
    }
    
    ExecuteTradingLogic();
@@ -217,7 +210,6 @@ bool IsTradeSessionValid(void)
    TimeToStruct(TimeCurrent(), dt);
    int hour = dt.hour;
    
-   // Check low volume hours
    if(InpAvoidLowVolumeHours)
    {
       for(int i = 0; i < ArraySize(g_state.profile.lowVolumeHours); i++)
@@ -230,35 +222,48 @@ bool IsTradeSessionValid(void)
          }
       }
    }
-   
    return true;
 }
 
+//+------------------------------------------------------------------+
+//| FIXED: Refresh Context from API with null-byte fix                 |
 //+------------------------------------------------------------------+
 void RefreshContextFromAPI(void)
 {
    string jsonRequest = BuildAnalysisRequest();
    
+   // Validate request
+   if(StringLen(jsonRequest) == 0)
+   {
+      Print("ERROR: Empty JSON request, skipping API call");
+      g_refreshManager.RecordApiFailure("Empty request data");
+      return;
+   }
+   
    string headers;
    StringAdd(headers, "Content-Type: application/json\r\n");
    if(StringLen(InpApiKey) > 0)
-   {
       StringAdd(headers, "Authorization: Bearer " + InpApiKey + "\r\n");
-   }
    
    char data[], result[];
    string url = InpApiUrl;
    int res;
    
-   StringToCharArray(jsonRequest, data);
+   // Convert to char array
+   int strLen = StringToCharArray(jsonRequest, data);
+   
+   // === CRITICAL FIX: Remove null terminator that causes HTTP 422 ===
+   if(strLen > 0)
+      ArrayResize(data, strLen);
    
    datetime callStart = TimeLocal();
    res = WebRequest("POST", url, headers, InpApiTimeoutMs, data, result, headers);
-   double responseTime = (double)(TimeLocal() - callStart);
    
    if(res != 200)
    {
       Print("API Error: HTTP ", res);
+      if(res == 422)
+         Print("JSON Sent: ", jsonRequest); // Debug info
       g_refreshManager.RecordApiFailure("HTTP " + IntegerToString(res));
       return;
    }
@@ -277,7 +282,7 @@ void RefreshContextFromAPI(void)
    g_state.volatilityRegime = json["regime"].ToStr();
    g_state.trendAlignment = json["trend_alignment"].ToDbl();
    
-   g_refreshManager.RecordApiSuccess(responseTime);
+   g_refreshManager.RecordApiSuccess((double)(TimeLocal() - callStart));
    g_state.lastContextUpdate = TimeCurrent();
    
    if(InpVerboseLogging)
@@ -324,6 +329,8 @@ void RefreshSignalFromAPI(void)
 }
 
 //+------------------------------------------------------------------+
+//| FIXED: Build Analysis Request with validation                      |
+//+------------------------------------------------------------------+
 string BuildAnalysisRequest(void)
 {
    MqlRates ratesM1[], ratesM5[], ratesM15[], ratesH1[], ratesD1[];
@@ -334,51 +341,70 @@ string BuildAnalysisRequest(void)
    ArraySetAsSeries(ratesH1, true);
    ArraySetAsSeries(ratesD1, true);
    
-   CopyRates(g_state.symbol, PERIOD_M1, 0, 100, ratesM1);
-   CopyRates(g_state.symbol, PERIOD_M5, 0, 100, ratesM5);
-   CopyRates(g_state.symbol, PERIOD_M15, 0, 50, ratesM15);
-   CopyRates(g_state.symbol, PERIOD_H1, 0, 50, ratesH1);
-   CopyRates(g_state.symbol, PERIOD_D1, 0, 20, ratesD1);
+   // Copy rates with error checking
+   int copied1 = CopyRates(g_state.symbol, PERIOD_M1, 0, 10, ratesM1);
+   int copied5 = CopyRates(g_state.symbol, PERIOD_M5, 0, 10, ratesM5);
+   int copied15 = CopyRates(g_state.symbol, PERIOD_M15, 0, 10, ratesM15);
+   int copiedH1 = CopyRates(g_state.symbol, PERIOD_H1, 0, 10, ratesH1);
+   int copiedD1 = CopyRates(g_state.symbol, PERIOD_D1, 0, 10, ratesD1);
    
+   // Validate all timeframes have data
+   if(copied1 <= 0 || copied5 <= 0 || copied15 <= 0 || copiedH1 <= 0 || copiedD1 <= 0)
+   {
+      Print("ERROR: Failed to copy rates. M1:", copied1, " M5:", copied5, 
+            " M15:", copied15, " H1:", copiedH1, " D1:", copiedD1);
+      return "";
+   }
+   
+   // Build JSON
    string json = "{";
    json += "\"symbol\": \"" + g_state.symbol + "\",";
    json += "\"asset_class\": \"gold\",";
    json += "\"timeframes\": {";
    
+   // M1
    json += "\"M1\": {";
    json += "\"open\": " + DoubleToString(ratesM1[0].open, g_state.profile.digits) + ",";
    json += "\"high\": " + DoubleToString(ratesM1[0].high, g_state.profile.digits) + ",";
    json += "\"low\": " + DoubleToString(ratesM1[0].low, g_state.profile.digits) + ",";
    json += "\"close\": " + DoubleToString(ratesM1[0].close, g_state.profile.digits) + ",";
-   json += "\"tick_volume\": " + IntegerToString(ratesM1[0].tick_volume) + ",";
-   json += "\"real_volume\": " + IntegerToString(ratesM1[0].real_volume);
+   json += "\"tick_volume\": " + IntegerToString((int)ratesM1[0].tick_volume) + ",";
+   json += "\"real_volume\": " + IntegerToString((int)ratesM1[0].real_volume);
    json += "},";
    
+   // M5
    json += "\"M5\": {";
    json += "\"close\": " + DoubleToString(ratesM5[0].close, g_state.profile.digits) + ",";
    json += "\"atr\": " + DoubleToString(CalculateATR(PERIOD_M5, 14), g_state.profile.digits);
    json += "},";
    
+   // M15
    json += "\"M15\": {";
    json += "\"close\": " + DoubleToString(ratesM15[0].close, g_state.profile.digits) + ",";
    json += "\"ema20\": " + DoubleToString(CalculateEMA(PERIOD_M15, 20), g_state.profile.digits);
    json += "},";
    
+   // H1
    json += "\"H1\": {";
    json += "\"close\": " + DoubleToString(ratesH1[0].close, g_state.profile.digits) + ",";
    json += "\"ema50\": " + DoubleToString(CalculateEMA(PERIOD_H1, 50), g_state.profile.digits);
    json += "},";
    
+   // D1
    json += "\"D1\": {";
    json += "\"close\": " + DoubleToString(ratesD1[0].close, g_state.profile.digits) + ",";
    json += "\"atr\": " + DoubleToString(CalculateATR(PERIOD_D1, 14), g_state.profile.digits);
    json += "}";
    
    json += "},";
+   
+   // Account
    json += "\"account\": {";
    json += "\"balance\": " + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + ",";
    json += "\"equity\": " + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2);
    json += "},";
+   
+   // Spread
    json += "\"spread_pips\": " + DoubleToString(g_spreadManager.GetSpreadPips(), 1);
    json += "}";
    
@@ -407,13 +433,9 @@ void ExecuteTradingLogic(void)
       return;
    
    if(g_state.signalDirection == 1 && CanOpenLong())
-   {
       OpenPosition(ORDER_TYPE_BUY);
-   }
    else if(g_state.signalDirection == -1 && CanOpenShort())
-   {
       OpenPosition(ORDER_TYPE_SELL);
-   }
 }
 
 //+------------------------------------------------------------------+
@@ -476,9 +498,7 @@ double CalculateLotSize(void)
    double riskAmount = balance * InpRiskPercent / 100.0;
    
    if(g_state.openPositions > 0)
-   {
       riskAmount *= InpPyramidLotMultiplier;
-   }
    
    double atr = CalculateATR(PERIOD_M5, 14);
    double slDistance = atr * g_state.profile.slMultiplier;
@@ -532,24 +552,19 @@ void ManageOpenPositions(void)
       {
          double potentialSL = tick.bid - trailDistance;
          if(potentialSL > openPrice && potentialSL > currentSL)
-         {
             newSL = potentialSL;
-         }
       }
       else
       {
          double potentialSL = tick.ask + trailDistance;
          if(potentialSL < openPrice && potentialSL < currentSL)
-         {
             newSL = potentialSL;
-         }
       }
       
       if(newSL != currentSL)
       {
          double tickSize = SymbolInfoDouble(g_state.symbol, SYMBOL_TRADE_TICK_SIZE);
          newSL = NormalizeDouble(MathRound(newSL / tickSize) * tickSize, g_state.profile.digits);
-         
          g_trade.PositionModify(PositionGetInteger(POSITION_TICKET), newSL, currentTP);
       }
    }
@@ -581,9 +596,7 @@ void UpdatePositionState(void)
    }
    
    if(g_state.totalLots > 0)
-   {
       g_state.avgEntryPrice = totalWeightedPrice / g_state.totalLots;
-   }
    else
    {
       g_state.avgEntryPrice = 0;
@@ -612,12 +625,9 @@ bool CheckEquityProtection(void)
 {
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double dailyRisk = InpMaxDailyRisk / 100.0;
    
-   if(equity < balance * (1 - dailyRisk))
-   {
+   if(equity < balance * (1 - InpMaxDailyRisk / 100.0))
       return true;
-   }
    
    return false;
 }
@@ -687,5 +697,4 @@ double CalculateEMA(ENUM_TIMEFRAMES tf, int period)
    IndicatorRelease(handle);
    return ema[0];
 }
-
 //+------------------------------------------------------------------+
