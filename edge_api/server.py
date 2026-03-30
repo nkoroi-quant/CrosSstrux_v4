@@ -1,102 +1,76 @@
 """
-CrosSstrux v4.1.0 - FastAPI Analysis Server
-
-Production-ready FastAPI server with:
-- Rate limiting (Redis if available, memory fallback)
-- Asset-specific caching TTLs
-- Request validation with Pydantic
-- Background task processing
-- Health check and metrics endpoints
+CrosSstrux v4.2.0 - FastAPI Analysis Server with Rolling Window Support
 """
-
-# Add this import at the top
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-
 
 import os
 import time
 import json
 import hashlib
 import logging
-from typing import Dict, List, Optional, Any
-from datetime import datetime, timedelta
-from functools import wraps
+import numpy as np
+from typing import Dict, List, Optional, Any, Tuple
+from datetime import datetime
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Depends, status
+from fastapi import FastAPI, HTTPException, Request, Depends, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 import uvicorn
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Try to import Redis, fall back to memory if unavailable
 try:
     import redis.asyncio as redis
     REDIS_AVAILABLE = True
 except ImportError:
     REDIS_AVAILABLE = False
-    logger.warning("Redis not available, using memory-based caching")
-
-# Import CrosSstrux modules
-
 
 try:
-    from core.asset_profiles import ASSET_PROFILES, get_profile, AssetClass
+    from core.asset_profiles import ASSET_PROFILES, get_profile
     from core.features.synthetic_volume import add_synthetic_volume
     from core.features.hierarchical_fusion import fuse_timeframe_features
     FEATURES_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     FEATURES_AVAILABLE = False
-    logger.warning("Feature modules not available, using basic analysis")
-
+    logger.warning(f"Feature modules not available: {e}")
 
 # =============================================================================
 # Pydantic Models
 # =============================================================================
 
-class TimeframeData(BaseModel):
-    """OHLC data for a specific timeframe"""
-    open: Optional[float] = None
-    high: Optional[float] = None
-    low: Optional[float] = None
+class CandleData(BaseModel):
+    time: int
+    open: float
+    high: float
+    low: float
     close: float
-    tick_volume: Optional[int] = None
-    real_volume: Optional[int] = None
+    tick_volume: int
+    real_volume: int
+
+class TimeframeWindow(BaseModel):
+    candles: List[CandleData]
     atr: Optional[float] = None
-    ema20: Optional[float] = None
-    ema50: Optional[float] = None
-
-
-class AccountInfo(BaseModel):
-    """Account information"""
-    balance: float
-    equity: float
-
 
 class AnalysisRequest(BaseModel):
-    """Request model for market analysis"""
-    symbol: str = Field(..., description="Trading symbol (e.g., BTCUSD, XAUUSD)")
-    asset_class: Optional[str] = Field(None, description="Asset class override")
-    timeframes: Dict[str, TimeframeData] = Field(..., description="Multi-timeframe data")
-    account: Optional[AccountInfo] = None
+    symbol: str
+    asset_class: Optional[str] = None
+    context_h1: TimeframeWindow
+    context_m15: TimeframeWindow
+    execution_m5: TimeframeWindow
+    execution_m1: TimeframeWindow
+    account: Optional[Dict[str, float]] = None
     spread_pips: Optional[float] = None
-    
-    @validator('symbol')
-    def validate_symbol(cls, v):
+
+    @field_validator('symbol')
+    @classmethod
+    def validate_symbol(cls, v: str) -> str:
         return v.upper().strip()
 
-
 class SignalResponse(BaseModel):
-    """Trading signal response"""
     signal: str = Field(..., pattern="^(BUY|SELL|HOLD)$")
     confidence: float = Field(..., ge=0.0, le=1.0)
     entry_precision: float = Field(..., ge=0.0, le=1.0)
@@ -106,56 +80,31 @@ class SignalResponse(BaseModel):
     execution_allowed: bool
     reason: Optional[str] = None
 
-
 class HealthResponse(BaseModel):
-    """Health check response"""
     status: str
     version: str
     timestamp: str
     redis_connected: bool
     uptime_seconds: float
 
-
-class MetricsResponse(BaseModel):
-    """Metrics response"""
-    total_requests: int
-    successful_requests: int
-    failed_requests: int
-    average_response_time_ms: float
-    cache_hit_rate: float
-    requests_per_minute: float
-
-
 # =============================================================================
-# Rate Limiting Implementation
+# Rate Limiter
 # =============================================================================
 
 class RateLimiter:
-    """
-    Token bucket rate limiter with Redis or memory backend.
-    """
-    
     def __init__(self, redis_client=None):
         self.redis = redis_client
         self.memory_store: Dict[str, Dict] = {}
         self.use_redis = redis_client is not None and REDIS_AVAILABLE
-        
-        # Rate limits by endpoint type
         self.limits = {
-            'default': {'requests': 10, 'window': 60},      # 10 req/min
-            'batch': {'requests': 2, 'window': 60},           # 2 req/min
-            'health': {'requests': 60, 'window': 60},          # 60 req/min
+            'default': {'requests': 60, 'window': 60},
+            'batch': {'requests': 5, 'window': 60},
         }
     
-    async def is_allowed(self, key: str, limit_type: str = 'default') -> tuple[bool, int, int]:
-        """
-        Check if request is allowed.
-        Returns: (allowed, remaining, retry_after)
-        """
+    async def is_allowed(self, key: str, limit_type: str = 'default') -> Tuple[bool, int, int]:
         limit_config = self.limits.get(limit_type, self.limits['default'])
         max_requests = limit_config['requests']
         window = limit_config['window']
-        
         now = time.time()
         
         if self.use_redis:
@@ -163,116 +112,61 @@ class RateLimiter:
         else:
             return self._check_memory(key, max_requests, window, now)
     
-    async def _check_redis(self, key: str, max_requests: int, window: int, now: float) -> tuple:
-        """Redis-backed rate limiting using sliding window"""
+    async def _check_redis(self, key: str, max_requests: int, window: int, now: float):
         pipe = self.redis.pipeline()
-        
-        # Remove old entries
         window_start = now - window
         pipe.zremrangebyscore(f"ratelimit:{key}", 0, window_start)
-        
-        # Count current entries
         pipe.zcard(f"ratelimit:{key}")
-        
-        # Add current request
         pipe.zadd(f"ratelimit:{key}", {str(now): now})
-        
-        # Set expiry
         pipe.expire(f"ratelimit:{key}", window)
-        
         results = await pipe.execute()
         current_count = results[1]
-        
         allowed = current_count < max_requests
         remaining = max(0, max_requests - current_count - 1)
         retry_after = int(window - (now % window)) if not allowed else 0
-        
         return allowed, remaining, retry_after
     
-    def _check_memory(self, key: str, max_requests: int, window: int, now: float) -> tuple:
-        """Memory-backed rate limiting"""
+    def _check_memory(self, key: str, max_requests: int, window: int, now: float):
         window_start = now - window
-        
         if key not in self.memory_store:
             self.memory_store[key] = {'requests': []}
-        
-        # Clean old requests
         self.memory_store[key]['requests'] = [
             req_time for req_time in self.memory_store[key]['requests']
             if req_time > window_start
         ]
-        
         current_count = len(self.memory_store[key]['requests'])
         allowed = current_count < max_requests
-        
         if allowed:
             self.memory_store[key]['requests'].append(now)
-        
         remaining = max(0, max_requests - current_count - 1)
         retry_after = int(window - (now % window)) if not allowed else 0
-        
-        # Cleanup old keys periodically
-        if len(self.memory_store) > 10000:
-            self._cleanup_memory()
-        
         return allowed, remaining, retry_after
-    
-    def _cleanup_memory(self):
-        """Clean up old entries from memory store"""
-        now = time.time()
-        cutoff = now - 3600  # 1 hour
-        
-        keys_to_remove = [
-            key for key, data in self.memory_store.items()
-            if not data['requests'] or max(data['requests']) < cutoff
-        ]
-        
-        for key in keys_to_remove:
-            del self.memory_store[key]
-        
-        logger.info(f"Rate limiter cleanup: removed {len(keys_to_remove)} old keys")
-
 
 # =============================================================================
 # Analysis Cache
 # =============================================================================
 
 class AnalysisCache:
-    """
-    Intelligent caching with asset-specific TTLs.
-    """
-    
     def __init__(self, redis_client=None):
         self.redis = redis_client
         self.use_redis = redis_client is not None and REDIS_AVAILABLE
         self.memory_cache: Dict[str, Dict] = {}
-        
-        # TTL map by asset class (seconds)
-        self.ttl_map = {
-            'cryptocurrency': 5,
-            'gold': 30,
-            'forex': 15,
-            'default': 10
-        }
-        
+        self.ttl_map = {'cryptocurrency': 5, 'gold': 30, 'forex': 15, 'default': 10}
         self.stats = {'hits': 0, 'misses': 0}
     
     def _get_cache_key(self, request: AnalysisRequest) -> str:
-        """Generate cache key from request"""
-        # Hash of symbol + timeframe closes
         key_data = {
             'symbol': request.symbol,
-            'closes': {tf: data.close for tf, data in request.timeframes.items()}
+            'h1_close': request.context_h1.candles[-1].close if request.context_h1.candles else 0,
+            'm5_close': request.execution_m5.candles[-1].close if request.execution_m5.candles else 0,
         }
         key_str = json.dumps(key_data, sort_keys=True)
         return hashlib.sha256(key_str.encode()).hexdigest()
     
     def get_ttl(self, asset_class: str) -> int:
-        """Get TTL for asset class"""
         return self.ttl_map.get(asset_class, self.ttl_map['default'])
     
     async def get(self, key: str) -> Optional[Dict]:
-        """Get cached result"""
         if self.use_redis:
             data = await self.redis.get(f"analysis:{key}")
             if data:
@@ -286,106 +180,62 @@ class AnalysisCache:
                     return entry['data']
                 else:
                     del self.memory_cache[key]
-        
         self.stats['misses'] += 1
         return None
     
     async def set(self, key: str, data: Dict, asset_class: str):
-        """Cache result with asset-specific TTL"""
         ttl = self.get_ttl(asset_class)
-        
         if self.use_redis:
-            await self.redis.setex(
-                f"analysis:{key}",
-                ttl,
-                json.dumps(data)
-            )
+            await self.redis.setex(f"analysis:{key}", ttl, json.dumps(data))
         else:
-            self.memory_cache[key] = {
-                'data': data,
-                'expires': time.time() + ttl
-            }
-    
-    def get_stats(self) -> Dict:
-        """Get cache statistics"""
-        total = self.stats['hits'] + self.stats['misses']
-        hit_rate = self.stats['hits'] / total if total > 0 else 0
-        
-        return {
-            'hits': self.stats['hits'],
-            'misses': self.stats['misses'],
-            'hit_rate': hit_rate,
-            'memory_entries': len(self.memory_cache)
-        }
-
+            self.memory_cache[key] = {'data': data, 'expires': time.time() + ttl}
 
 # =============================================================================
 # Analysis Engine
 # =============================================================================
 
 class AnalysisEngine:
-    """
-    Core analysis engine for generating trading signals.
-    """
-    
     def __init__(self):
-        self.model = None  # Placeholder for ML model
+        self.model = None
     
     async def analyze(self, request: AnalysisRequest) -> SignalResponse:
-        """
-        Perform market analysis and generate signal.
-        """
         start_time = time.time()
         
-        # Get asset profile
-        profile = get_profile(request.symbol)
-        asset_class = request.asset_class or profile.asset_class.value
+        try:
+            profile = get_profile(request.symbol)
+            asset_class = request.asset_class or profile.asset_class.value
+        except:
+            asset_class = 'default'
+            profile = None
         
         # Check spread
         spread_status = "OK"
         execution_allowed = True
         reason = None
         
-        if request.spread_pips is not None:
-            if request.spread_pips > profile.spread_emergency_pips:
+        if request.spread_pips and profile:
+            if request.spread_pips > getattr(profile, 'spread_emergency_pips', 50):
                 spread_status = "EMERGENCY"
                 execution_allowed = False
-                reason = f"Spread {request.spread_pips}pips exceeds emergency {profile.spread_emergency_pips}pips"
-            elif request.spread_pips > profile.spread_threshold_pips:
+                reason = f"Spread {request.spread_pips}pips exceeds emergency limit"
+            elif request.spread_pips > getattr(profile, 'spread_threshold_pips', 20):
                 spread_status = "HIGH"
-                # Still allow but with warning
         
-        # Extract features if modules available
+        # Analysis
         if FEATURES_AVAILABLE:
-            # Convert to dataframes and add synthetic volume if needed
-            df_dict = self._convert_to_dataframes(request.timeframes)
-            
-            if not profile.volume_reliable:
-                for tf, df in df_dict.items():
-                    df_dict[tf] = add_synthetic_volume(df, request.symbol, tf)
-            
-            # Fuse features
             try:
-                fused_features = fuse_timeframe_features(df_dict, target_tf='M5')
-                # Use fused features for prediction
-                signal, confidence = self._predict_with_features(fused_features)
+                signal, confidence = await self._analyze_with_features(request, profile)
             except Exception as e:
-                logger.error(f"Feature fusion error: {e}")
-                signal, confidence = self._basic_analysis(request)
+                logger.error(f"Feature analysis error: {e}")
+                signal, confidence = self._basic_window_analysis(request)
         else:
-            signal, confidence = self._basic_analysis(request)
+            signal, confidence = self._basic_window_analysis(request)
         
-        # Calculate entry precision
-        entry_precision = self._calculate_entry_precision(request, profile)
+        entry_precision = self._calc_entry_precision(request)
+        regime = self._detect_regime(request.context_h1.candles)
+        trend_alignment = self._calc_trend_alignment(request)
         
-        # Detect regime
-        regime = self._detect_regime(request.timeframes)
-        
-        # Calculate trend alignment
-        trend_alignment = self._calculate_trend_alignment(request.timeframes)
-        
-        response_time = (time.time() - start_time) * 1000
-        logger.info(f"Analysis completed in {response_time:.1f}ms for {request.symbol}")
+        logger.info(f"Analysis completed in {(time.time() - start_time)*1000:.1f}ms for {request.symbol}")
         
         return SignalResponse(
             signal=signal,
@@ -398,145 +248,258 @@ class AnalysisEngine:
             reason=reason
         )
     
-    def _convert_to_dataframes(self, timeframes: Dict[str, TimeframeData]) -> Dict:
-        """Convert timeframe data to pandas DataFrames"""
+    def _candles_to_df(self, candles: List[CandleData]):
         import pandas as pd
+        data = {
+            'time': [c.time for c in candles],
+            'open': [c.open for c in candles],
+            'high': [c.high for c in candles],
+            'low': [c.low for c in candles],
+            'close': [c.close for c in candles],
+            'tick_volume': [c.tick_volume for c in candles],
+            'real_volume': [c.real_volume for c in candles]
+        }
+        df = pd.DataFrame(data)
         
-        df_dict = {}
-        for tf, data in timeframes.items():
-            df_data = {
-                'open': [data.open] if data.open else [data.close],
-                'high': [data.high] if data.high else [data.close],
-                'low': [data.low] if data.low else [data.close],
-                'close': [data.close],
-            }
-            if data.tick_volume:
-                df_data['tick_volume'] = [data.tick_volume]
-            if data.real_volume:
-                df_data['real_volume'] = [data.real_volume]
-            if data.atr:
-                df_data['atr'] = [data.atr]
-            if data.ema20:
-                df_data['ema20'] = [data.ema20]
-            if data.ema50:
-                df_data['ema50'] = [data.ema50]
+        # CRITICAL FIX: Convert Unix timestamp (seconds from MT5) to DatetimeIndex
+        df['time'] = pd.to_datetime(df['time'], unit='s')
+        df.set_index('time', inplace=True)
+        df.sort_index(inplace=True)  # Ensure chronological order
+        
+        return df
+
+    async def _analyze_with_features(self, request: AnalysisRequest, profile):
+        """Analyze with manual feature calculation - completely bypasses fusion library"""
+        import pandas as pd
+        import numpy as np
+        
+        context_dfs = {
+            'H1': self._candles_to_df(request.context_h1.candles),
+            'M15': self._candles_to_df(request.context_m15.candles)
+        }
+        execution_dfs = {
+            'M5': self._candles_to_df(request.execution_m5.candles),
+            'M1': self._candles_to_df(request.execution_m1.candles)
+        }
+        
+        # Validate data
+        if len(context_dfs['H1']) < 10 or len(execution_dfs['M5']) < 10:
+            return self._basic_window_analysis(request)
+        
+        try:
+            # Add synthetic volume if needed (optional enhancement)
+            if profile and not profile.volume_reliable:
+                try:
+                    for tf, df in context_dfs.items():
+                        if not df.empty:
+                            context_dfs[tf] = add_synthetic_volume(df, request.symbol, tf)
+                    for tf, df in execution_dfs.items():
+                        if not df.empty:
+                            execution_dfs[tf] = add_synthetic_volume(df, request.symbol, tf)
+                except Exception as vol_err:
+                    logger.warning(f"Synthetic volume failed: {vol_err}, proceeding without")
             
-            df_dict[tf] = pd.DataFrame(df_data)
-        
-        return df_dict
-    
-    def _predict_with_features(self, features) -> tuple[str, float]:
-        """Generate prediction from features"""
-        # Placeholder - integrate with actual model
-        # This would use HistGradientBoosting or similar
-        
-        # Simple heuristic for demonstration
-        last_row = features.iloc[-1] if len(features) > 0 else None
-        
-        if last_row is not None:
-            # Use trend alignment features
-            trend_score = last_row.get('trend_alignment_score', 0.5)
+            # Manual feature calculation instead of fusion
+            ctx_score = self._calculate_context_score(context_dfs)
+            exec_score = self._calculate_execution_score(execution_dfs)
             
-            if trend_score > 0.6:
-                return "BUY", min(trend_score, 0.9)
-            elif trend_score < 0.4:
-                return "SELL", min(1 - trend_score, 0.9)
+            # Combine scores (60% context, 40% execution as per original design)
+            combined = (ctx_score * 0.6) + (exec_score * 0.4)
+            
+            logger.info(f"Manual fusion - Context: {ctx_score:.3f}, Execution: {exec_score:.3f}, Combined: {combined:.3f}")
+            
+            if combined > 0.65:
+                return "BUY", min(combined, 0.95)
+            elif combined < 0.35:
+                return "SELL", min(1 - combined, 0.95)
+            
+            return "HOLD", 0.5
+            
+        except Exception as e:
+            logger.error(f"Manual feature analysis error: {e}")
+            return self._basic_window_analysis(request)
+
+    def _calculate_context_score(self, context_dfs: dict) -> float:
+        """Calculate trend alignment score from H1 and M15 without fusion library"""
+        import numpy as np
         
-        return "HOLD", 0.5
-    
-    def _basic_analysis(self, request: AnalysisRequest) -> tuple[str, float]:
-        """Basic analysis without ML features"""
-        # Simple multi-timeframe trend analysis
-        closes = {}
-        for tf, data in request.timeframes.items():
-            closes[tf] = data.close
+        h1_df = context_dfs.get('H1')
+        m15_df = context_dfs.get('M15')
         
-        # Check alignment across timeframes
-        higher_tf = ['W1', 'D1', 'H4', 'H1']
-        lower_tf = ['M15', 'M5', 'M1']
-        
-        higher_bullish = sum(1 for tf in higher_tf if tf in closes and 
-                            any(c > closes[tf] for c in [closes.get('D1', 0), closes.get('H1', 0)]))
-        
-        if higher_bullish >= 2:
-            return "BUY", 0.6
-        elif higher_bullish <= 1:
-            return "SELL", 0.6
-        
-        return "HOLD", 0.5
-    
-    def _calculate_entry_precision(self, request: AnalysisRequest, profile) -> float:
-        """Calculate entry precision score"""
-        # Based on distance from key levels, wick rejection, etc.
-        base_score = 0.5
-        
-        # Adjust based on spread
-        if request.spread_pips and request.spread_pips < profile.spread_threshold_pips:
-            base_score += 0.1
-        
-        # Adjust based on timeframe alignment
-        closes = {tf: data.close for tf, data in request.timeframes.items()}
-        if 'H1' in closes and 'M5' in closes:
-            # Check if M5 aligns with H1 direction
-            h1_trend = closes['H1']  # Simplified
-            m5_price = closes['M5']
-            # Add precision if aligned
-            base_score += 0.1
-        
-        return min(base_score, 1.0)
-    
-    def _detect_regime(self, timeframes: Dict[str, TimeframeData]) -> str:
-        """Detect volatility regime"""
-        # Use ATR if available
-        atrs = []
-        for tf, data in timeframes.items():
-            if data.atr and data.close:
-                atr_pct = (data.atr / data.close) * 100
-                atrs.append(atr_pct)
-        
-        if not atrs:
-            return "NORMAL"
-        
-        avg_atr = sum(atrs) / len(atrs)
-        
-        if avg_atr < 0.5:
-            return "LOW"
-        elif avg_atr < 1.5:
-            return "NORMAL"
-        elif avg_atr < 3.0:
-            return "HIGH"
-        else:
-            return "BREAKOUT"
-    
-    def _calculate_trend_alignment(self, timeframes: Dict[str, TimeframeData]) -> float:
-        """Calculate trend alignment across timeframes"""
-        closes = {tf: data.close for tf, data in timeframes.items() if data.close}
-        
-        if len(closes) < 2:
+        if h1_df is None or len(h1_df) < 5 or m15_df is None or len(m15_df) < 5:
             return 0.5
         
-        # Check if higher timeframes agree
-        higher = ['W1', 'D1', 'H4', 'H1']
-        lower = ['M30', 'M15', 'M5', 'M1']
-        
-        higher_closes = [closes[tf] for tf in higher if tf in closes]
-        lower_closes = [closes[tf] for tf in lower if tf in closes]
-        
-        if len(higher_closes) >= 2 and len(lower_closes) >= 1:
-            # Simple check: are we above or below average
-            higher_avg = sum(higher_closes) / len(higher_closes)
-            lower_avg = sum(lower_closes) / len(lower_closes)
+        def get_trend_strength(df):
+            """Calculate trend strength using linear regression slope normalized to 0-1"""
+            x = np.arange(len(df))
+            y = df['close'].values
             
-            # Alignment score
-            if (lower_avg > higher_avg * 0.99) and (lower_avg < higher_avg * 1.01):
-                return 0.8  # Well aligned
-            elif (lower_avg > higher_avg * 0.98) and (lower_avg < higher_avg * 1.02):
-                return 0.6  # Moderately aligned
-            else:
-                return 0.4  # Poor alignment
+            # Normalize price to percentage change from start
+            y_norm = (y - y[0]) / y[0] if y[0] != 0 else y
+            
+            # Linear regression slope
+            try:
+                slope = np.polyfit(x, y_norm, 1)[0]
+            except:
+                return 0.5
+            
+            # Convert slope to score: 0.5 = neutral, 1.0 = strong up, 0.0 = strong down
+            # Scale factor tuned for 30-candle windows (multiply by len to normalize)
+            score = 0.5 + (slope * len(df) * 5)
+            return float(np.clip(score, 0.0, 1.0))
         
-        return 0.5
+        h1_trend = get_trend_strength(h1_df)
+        m15_trend = get_trend_strength(m15_df)
+        
+        # Trend alignment: if both agree, boost confidence; if disagree, neutralize toward 0.5
+        trend_diff = abs(h1_trend - m15_trend)
+        
+        # Average the trends
+        avg_trend = (h1_trend + m15_trend) / 2
+        
+        # If they disagree significantly (>0.3 apart), dampen the signal toward neutral
+        if trend_diff > 0.3:
+            final_score = 0.5 + (avg_trend - 0.5) * (1 - trend_diff)
+        else:
+            final_score = avg_trend
+        
+        return float(np.clip(final_score, 0.0, 1.0))
 
+
+
+    
+    def _basic_window_analysis(self, request: AnalysisRequest):
+        h1_candles = request.context_h1.candles
+        m5_candles = request.execution_m5.candles
+        
+        if len(h1_candles) < 5 or len(m5_candles) < 5:
+            return "HOLD", 0.5
+        
+        h1_change = (h1_candles[-1].close - h1_candles[0].close) / h1_candles[0].close if h1_candles[0].close != 0 else 0
+        m5_change = (m5_candles[-1].close - m5_candles[0].close) / m5_candles[0].close if m5_candles[0].close != 0 else 0
+        
+        if h1_change > 0.001 and m5_change > 0.0005:
+            return "BUY", 0.7
+        elif h1_change < -0.001 and m5_change < -0.0005:
+            return "SELL", 0.7
+        
+        return "HOLD", 0.5
+
+    def _calculate_execution_score(self, execution_dfs: dict) -> float:
+        """Calculate momentum score from M5 and M1 without fusion library"""
+        import numpy as np
+        
+        m5_df = execution_dfs.get('M5')
+        m1_df = execution_dfs.get('M1')
+        
+        if m5_df is None or len(m5_df) < 5:
+            return 0.5
+        
+        def get_momentum(df, name=""):
+            """Calculate momentum score 0-1 based on recent price velocity"""
+            # Split into recent (last 5) vs previous (before last 5)
+            recent = df['close'].iloc[-5:].mean()
+            previous_idx = max(0, len(df) - 10)
+            previous = df['close'].iloc[previous_idx:-5].mean() if len(df) > 5 else df['close'].iloc[0]
+            
+            if previous == 0:
+                return 0.5
+            
+            pct_change = (recent - previous) / previous
+            
+            # Convert to score: 0.5 = neutral, scale factor 50 for typical gold/forex moves
+            score = 0.5 + (pct_change * 50)
+            
+            # Volatility adjustment - reduce confidence if current candle is an outlier spike
+            ranges = (df['high'] - df['low']).values
+            if len(ranges) > 5 and np.mean(ranges[:-1]) > 0:
+                avg_range = np.mean(ranges[:-1])
+                current_range = ranges[-1]
+                if current_range > avg_range * 3:  # Spike detected
+                    score = 0.5 + (score - 0.5) * 0.3  # Reduce confidence heavily
+            
+            return float(np.clip(score, 0.0, 1.0))
+        
+        m5_momentum = get_momentum(m5_df, "M5")
+        
+        # If M1 available, use it but weight it lower (noisier)
+        if m1_df is not None and len(m1_df) >= 5:
+            m1_momentum = get_momentum(m1_df, "M1")
+            # Weight M5 higher (0.7) than M1 (0.3) for execution reliability
+            final_score = (m5_momentum * 0.7) + (m1_momentum * 0.3)
+        else:
+            final_score = m5_momentum
+        
+        return float(np.clip(final_score, 0.0, 1.0))
+
+    
+    def _calc_entry_precision(self, request: AnalysisRequest):
+        m1_candles = request.execution_m1.candles
+        if len(m1_candles) < 5:
+            return 0.5
+        
+        recent_ranges = [c.high - c.low for c in m1_candles[-5:]]
+        avg_range = sum(recent_ranges) / len(recent_ranges)
+        current_range = m1_candles[-1].high - m1_candles[-1].low
+        
+        if avg_range == 0:
+            return 0.5
+        
+        ratio = current_range / avg_range
+        if ratio < 0.7:
+            return 0.8
+        elif ratio > 1.3:
+            return 0.4
+        return 0.6
+    
+    def _detect_regime(self, h1_candles: List[CandleData]):
+        if len(h1_candles) < 10:
+            return "NORMAL"
+        
+        closes = [c.close for c in h1_candles]
+        returns = [(closes[i] - closes[i-1])/closes[i-1] for i in range(1, len(closes)) if closes[i-1] != 0]
+        
+        if not returns:
+            return "NORMAL"
+        
+        volatility = sum(r**2 for r in returns) / len(returns)
+        
+        if volatility < 0.0001:
+            return "LOW"
+        elif volatility < 0.0005:
+            return "NORMAL"
+        elif volatility < 0.001:
+            return "HIGH"
+        return "BREAKOUT"
+    
+    def _calc_trend_alignment(self, request: AnalysisRequest):
+        h1 = self._get_window_trend(request.context_h1.candles)
+        m15 = self._get_window_trend(request.context_m15.candles)
+        m5 = self._get_window_trend(request.execution_m5.candles)
+        
+        agreement = 0.0
+        if h1 == m15:
+            agreement += 0.4
+        if m15 == m5:
+            agreement += 0.4
+        if h1 == m5:
+            agreement += 0.2
+        
+        return agreement
+    
+    def _get_window_trend(self, candles: List[CandleData]):
+        if len(candles) < 10:
+            return "NEUTRAL"
+        
+        first = candles[0].close
+        last = candles[-1].close
+        mid = candles[len(candles)//2].close
+        
+        if last > mid > first:
+            return "BULLISH"
+        elif last < mid < first:
+            return "BEARISH"
+        return "NEUTRAL"
 
 # =============================================================================
 # Global State
@@ -554,91 +517,82 @@ metrics = {
     'start_time': time.time()
 }
 
-
 # =============================================================================
-# FastAPI Application
+# FastAPI App
 # =============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan handler"""
     global redis_client, rate_limiter, analysis_cache, analysis_engine
     
-    # Startup
-    logger.info("Starting CrosSstrux Analysis Server v4.1.0")
+    logger.info("Starting CrosSstrux Analysis Server v4.2.0")
     
-    # Initialize Redis if available
     if REDIS_AVAILABLE:
         try:
             redis_host = os.getenv('REDIS_HOST', 'localhost')
             redis_port = int(os.getenv('REDIS_PORT', 6379))
-            redis_client = redis.Redis(
-                host=redis_host,
-                port=redis_port,
-                decode_responses=True
-            )
+            redis_client = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
             await redis_client.ping()
             logger.info(f"Redis connected: {redis_host}:{redis_port}")
         except Exception as e:
-            logger.warning(f"Redis connection failed: {e}, using memory fallback")
+            logger.warning(f"Redis failed: {e}")
             redis_client = None
     
-    # Initialize components
     rate_limiter = RateLimiter(redis_client)
     analysis_cache = AnalysisCache(redis_client)
     analysis_engine = AnalysisEngine()
     
     yield
     
-    # Shutdown
     logger.info("Shutting down...")
     if redis_client:
         await redis_client.close()
 
-
 app = FastAPI(
     title="CrosSstrux Analysis API",
-    description="Multi-asset AI-assisted trading analysis",
-    version="4.1.0",
+    description="Multi-asset AI-assisted trading analysis with rolling windows",
+    version="4.2.0",
     lifespan=lifespan
 )
 
-# Add this exception handler after app creation
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    logger.error(f"Validation error: {exc.errors()}")
-    logger.error(f"Request body: {await request.body()}")
-    return JSONResponse(
-        status_code=422,
-        content={"detail": exc.errors()}
-    )
-
-
-# Middleware
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# =============================================================================
+# Exception Handlers
+# =============================================================================
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    body = await request.body()
+    # Strip null bytes for logging
+    clean_body = body.rstrip(b'\x00')
+    logger.error(f"Validation error: {exc.errors()}")
+    logger.error(f"Request body: {clean_body}")
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 # =============================================================================
 # Dependencies
 # =============================================================================
 
 async def check_rate_limit(request: Request, limit_type: str = 'default'):
-    """Dependency for rate limiting"""
-    # Get client identifier
     client_ip = request.client.host if request.client else "unknown"
     forwarded = request.headers.get('X-Forwarded-For')
     if forwarded:
         client_ip = forwarded.split(',')[0].strip()
     
     key = f"{client_ip}:{request.url.path}"
-    
     allowed, remaining, retry_after = await rate_limiter.is_allowed(key, limit_type)
     
     if not allowed:
@@ -647,171 +601,105 @@ async def check_rate_limit(request: Request, limit_type: str = 'default'):
             detail="Rate limit exceeded",
             headers={"Retry-After": str(retry_after)}
         )
-    
     return {"remaining": remaining}
 
+async def rate_limit_default(request: Request):
+    return await check_rate_limit(request, 'default')
 
 # =============================================================================
-# Endpoints
+# Endpoints - CRITICAL FIX HERE
 # =============================================================================
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Health check endpoint"""
     return HealthResponse(
         status="healthy",
-        version="4.1.0",
+        version="4.2.0",
         timestamp=datetime.utcnow().isoformat(),
         redis_connected=redis_client is not None and REDIS_AVAILABLE,
         uptime_seconds=time.time() - metrics['start_time']
     )
 
-
-@app.get("/metrics", response_model=MetricsResponse)
-async def get_metrics():
-    """Get server metrics"""
-    total = metrics['total_requests']
-    avg_time = sum(metrics['response_times']) / len(metrics['response_times']) if metrics['response_times'] else 0
-    
-    uptime_minutes = (time.time() - metrics['start_time']) / 60
-    rpm = metrics['total_requests'] / uptime_minutes if uptime_minutes > 0 else 0
-    
-    cache_stats = analysis_cache.get_stats() if analysis_cache else {'hit_rate': 0}
-    
-    return MetricsResponse(
-        total_requests=metrics['total_requests'],
-        successful_requests=metrics['successful_requests'],
-        failed_requests=metrics['failed_requests'],
-        average_response_time_ms=avg_time,
-        cache_hit_rate=cache_stats['hit_rate'],
-        requests_per_minute=rpm
-    )
-
-
-@app.post("/analyze", response_model=SignalResponse)
-async def analyze(
-    request: AnalysisRequest,
-    background_tasks: BackgroundTasks,
-    rate_limit: dict = Depends(lambda r: check_rate_limit(r, 'default'))
-):
+@app.post("/analyze")
+async def analyze(request: Request, rate_limit: dict = Depends(rate_limit_default)):
     """
-    Analyze market data and generate trading signal.
-    
-    Rate limit: 10 requests per minute per IP
-    Cache TTL: Asset-specific (crypto: 5s, gold: 30s, forex: 15s)
+    Analyze market data with manual JSON parsing to handle MQL5 null bytes.
     """
+    global metrics
     start_time = time.time()
     metrics['total_requests'] += 1
     
     try:
+        # CRITICAL FIX: Read body and strip null bytes before parsing
+        body = await request.body()
+        clean_body = body.rstrip(b'\x00').strip()
+        
+        # Parse JSON manually
+        try:
+            data = json.loads(clean_body)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {e}")
+            logger.error(f"Body preview: {clean_body[:200]}")
+            metrics['failed_requests'] += 1
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
+        
+        # Convert to Pydantic model manually
+        try:
+            analysis_request = AnalysisRequest(**data)
+        except Exception as e:
+            logger.error(f"Pydantic validation error: {e}")
+            metrics['failed_requests'] += 1
+            raise HTTPException(status_code=422, detail=f"Validation error: {str(e)}")
+        
         # Check cache
-        cache_key = analysis_cache._get_cache_key(request)
+        cache_key = analysis_cache._get_cache_key(analysis_request)
         cached = await analysis_cache.get(cache_key)
         
         if cached:
-            # Return cached result
+            response_time = (time.time() - start_time) * 1000
+            metrics['response_times'].append(response_time)
             return SignalResponse(**cached)
         
         # Perform analysis
-        result = await analysis_engine.analyze(request)
+        result = await analysis_engine.analyze(analysis_request)
         
         # Cache result
-        profile = get_profile(request.symbol)
-        background_tasks.add_task(
-            analysis_cache.set,
-            cache_key,
-            result.dict(),
-            profile.asset_class.value
-        )
+        try:
+            profile = get_profile(analysis_request.symbol)
+            asset_class = profile.asset_class.value
+        except:
+            asset_class = 'default'
+        
+        await analysis_cache.set(cache_key, result.dict(), asset_class)
         
         metrics['successful_requests'] += 1
-        
-        # Record response time
         response_time = (time.time() - start_time) * 1000
         metrics['response_times'].append(response_time)
         
-        # Keep only last 1000 response times
         if len(metrics['response_times']) > 1000:
             metrics['response_times'] = metrics['response_times'][-1000:]
         
         return result
         
+    except HTTPException:
+        raise
     except Exception as e:
         metrics['failed_requests'] += 1
-        logger.error(f"Analysis error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Analysis failed: {str(e)}"
-        )
-
-
-@app.post("/analyze/batch")
-async def analyze_batch(
-    requests: List[AnalysisRequest],
-    rate_limit: dict = Depends(lambda r: check_rate_limit(r, 'batch'))
-):
-    """
-    Batch analysis endpoint for multiple symbols.
-    
-    Rate limit: 2 requests per minute per IP
-    """
-    results = []
-    
-    for req in requests:
-        try:
-            result = await analysis_engine.analyze(req)
-            results.append({
-                "symbol": req.symbol,
-                "success": True,
-                "result": result
-            })
-        except Exception as e:
-            results.append({
-                "symbol": req.symbol,
-                "success": False,
-                "error": str(e)
-            })
-    
-    return {"results": results}
-
+        logger.error(f"Analysis error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
 @app.get("/assets")
 async def list_assets():
-    """List all supported assets and their configurations"""
-    profiles = ASSET_PROFILES.list_profiles()
-    
-    return {
-        "assets": [
-            {
-                "symbol": symbol,
-                "profile": ASSET_PROFILES.get_profile(symbol).to_dict()
-            }
-            for symbol in profiles
-        ]
-    }
-
-
-# =============================================================================
-# Error Handlers
-# =============================================================================
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail},
-        headers=exc.headers
-    )
-
-
-@app.exception_handler(Exception)
-async def general_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled exception: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Internal server error"}
-    )
-
+    try:
+        profiles = ASSET_PROFILES.list_profiles()
+        return {
+            "assets": [
+                {"symbol": symbol, "profile": ASSET_PROFILES.get_profile(symbol).to_dict()}
+                for symbol in profiles
+            ]
+        }
+    except:
+        return {"assets": []}
 
 # =============================================================================
 # Main
@@ -819,12 +707,5 @@ async def general_exception_handler(request: Request, exc: Exception):
 
 if __name__ == "__main__":
     port = int(os.getenv('PORT', 8000))
-    host = os.getenv('HOST', '0.0.0.0')
-    
-    uvicorn.run(
-        "server:app",
-        host=host,
-        port=port,
-        reload=os.getenv('DEBUG', 'false').lower() == 'true',
-        workers=int(os.getenv('WORKERS', 1))
-    )
+    host = os.getenv('HOST', '127.0.0.1')
+    uvicorn.run("server:app", host=host, port=port, reload=os.getenv('DEBUG', 'false').lower() == 'true')

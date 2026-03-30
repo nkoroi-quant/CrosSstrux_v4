@@ -1,9 +1,7 @@
 ﻿//+------------------------------------------------------------------+
-//| GoldDiggr_v4_1_Fixed.mq5 - XAUUSD Expert Advisor v4.2         |
+//| GoldDiggr_v4_2_RollingWindow.mq5 - Sends 30-candle windows       |
 //+------------------------------------------------------------------+
-//| Description: Fixed version with proper JSON handling for FastAPI |
-//+------------------------------------------------------------------+
-#property copyright "CrosSstrux v4.1"
+#property copyright "CrosSstrux v4.2"
 #property link      "https://github.com/nkoroi-quant/CrosSstrux_v4"
 #property version   "4.2"
 #property strict
@@ -31,18 +29,9 @@ input double InpMinSignalConfidence = 0.65;
 input bool   InpRequireTrendAlignment = true;
 input int    InpMaxPyramidTrades = 3;
 
-input group "=== Pyramiding ==="
-input bool   InpEnablePyramiding = true;
-input double InpPyramidDistanceATR = 0.5;
-input double InpPyramidLotMultiplier = 1.0;
-
-input group "=== Session Filters ==="
-input bool   InpUseSessionFilter = true;
-input bool   InpAvoidLowVolumeHours = true;
-
-input group "=== Logging ==="
-input bool   InpVerboseLogging = true;
-input int    InpLogFrequency = 20;
+input group "=== Window Settings ==="
+input int    InpContextWindowSize = 30;  // H1 and M15 candles
+input int    InpExecutionWindowSize = 30; // M5 and M1 candles
 
 //--- Global Objects
 CTrade      g_trade;
@@ -50,53 +39,35 @@ CAssetProfileRegistry g_profileRegistry;
 CSpreadManager g_spreadManager;
 CContextRefreshManager g_refreshManager;
 
-//--- Trading State
 struct TradingState
 {
    string symbol;
    AssetProfile profile;
-   
    string lastApiResponse;
    datetime lastContextUpdate;
    datetime lastSignalUpdate;
-   
    double signalDirection;
    double signalConfidence;
    double entryPrecision;
    string volatilityRegime;
    double trendAlignment;
-   
    int openPositions;
    double totalLots;
    double avgEntryPrice;
    double unrealizedPnL;
    datetime lastTradeTime;
    int pyramidCount;
-   
    double dailyPnL;
    int dailyTrades;
    datetime tradingDay;
    
    void Reset()
    {
-      symbol = "";
-      lastApiResponse = "";
-      lastContextUpdate = 0;
-      lastSignalUpdate = 0;
-      signalDirection = 0;
-      signalConfidence = 0;
-      entryPrecision = 0;
-      volatilityRegime = "UNKNOWN";
-      trendAlignment = 0;
-      openPositions = 0;
-      totalLots = 0;
-      avgEntryPrice = 0;
-      unrealizedPnL = 0;
-      lastTradeTime = 0;
-      pyramidCount = 0;
-      dailyPnL = 0;
-      dailyTrades = 0;
-      tradingDay = 0;
+      symbol = ""; lastApiResponse = ""; lastContextUpdate = 0; lastSignalUpdate = 0;
+      signalDirection = 0; signalConfidence = 0; entryPrecision = 0;
+      volatilityRegime = "UNKNOWN"; trendAlignment = 0; openPositions = 0;
+      totalLots = 0; avgEntryPrice = 0; unrealizedPnL = 0; lastTradeTime = 0;
+      pyramidCount = 0; dailyPnL = 0; dailyTrades = 0; tradingDay = 0;
    }
 };
 
@@ -107,26 +78,17 @@ datetime g_startTime = 0;
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("=== GoldDiggr v4.1.1 (FIXED) Initializing ===");
-   
+   Print("=== GoldDiggr v4.2.0 (Rolling Window) Initializing ===");
    g_state.symbol = Symbol();
    
    if(!g_spreadManager.Initialize(g_state.symbol))
-   {
-      Print("ERROR: Failed to initialize SpreadManager");
       return INIT_FAILED;
-   }
    
    if(!g_profileRegistry.GetProfile(g_state.symbol, g_state.profile))
-   {
       Print("WARNING: Using default profile for ", g_state.symbol);
-   }
    
    if(!g_refreshManager.Initialize(g_state.symbol, &g_spreadManager))
-   {
-      Print("ERROR: Failed to initialize ContextRefreshManager");
       return INIT_FAILED;
-   }
    
    g_trade.SetExpertMagicNumber(42002);
    g_trade.SetDeviationInPoints(10);
@@ -139,9 +101,7 @@ int OnInit()
    g_startTime = TimeCurrent();
    g_state.tradingDay = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
    
-   Print("GoldDiggr initialized successfully for ", g_state.symbol);
-   Print("API Endpoint: ", InpApiUrl);
-   
+   Print("GoldDiggr initialized. Context: ", InpContextWindowSize, " candles | Execution: ", InpExecutionWindowSize, " candles");
    return(INIT_SUCCEEDED);
 }
 
@@ -158,7 +118,7 @@ void OnTick()
 {
    g_tickCount++;
    
-   if(InpVerboseLogging && g_tickCount % InpLogFrequency == 0)
+   if(g_tickCount % 20 == 0)
    {
       g_spreadManager.UpdateStatistics();
       g_spreadManager.LogSpreadStatus();
@@ -168,102 +128,77 @@ void OnTick()
    CheckDailyReset();
    
    if(InpUseEquityCurveProtection && CheckEquityProtection())
-   {
-      if(g_tickCount % 100 == 0)
-         Print("Equity protection active");
       return;
-   }
    
-   g_spreadManager.UpdateStatistics();
    if(!g_spreadManager.IsSpreadAcceptable())
-   {
-      if(g_tickCount % 100 == 0)
-         Print("Spread filter: ", g_spreadManager.GetRejectionReason());
-      return;
-   }
-   
-   if(InpUseSessionFilter && !IsTradeSessionValid())
       return;
    
    g_refreshManager.UpdateAdaptiveIntervals();
    
    if(g_refreshManager.ShouldRefreshContext())
-   {
-      if(g_refreshManager.ShouldCallAPI())
-         RefreshContextFromAPI();
-   }
+      RefreshContextFromAPI();
    
    if(g_refreshManager.ShouldRefreshSignal())
-   {
-      if(g_refreshManager.ShouldCallAPI())
-         RefreshSignalFromAPI();
-   }
+      RefreshSignalFromAPI();
    
    ExecuteTradingLogic();
    ManageOpenPositions();
 }
 
 //+------------------------------------------------------------------+
-bool IsTradeSessionValid(void)
-{
-   MqlDateTime dt;
-   TimeToStruct(TimeCurrent(), dt);
-   int hour = dt.hour;
-   
-   if(InpAvoidLowVolumeHours)
-   {
-      for(int i = 0; i < ArraySize(g_state.profile.lowVolumeHours); i++)
-      {
-         if(g_state.profile.lowVolumeHours[i] == hour)
-         {
-            if(g_tickCount % 300 == 0)
-               Print("Low volume hour - reduced activity");
-            return false;
-         }
-      }
-   }
-   return true;
-}
-
-//+------------------------------------------------------------------+
-//| FIXED: Refresh Context from API with null-byte fix                 |
-//+------------------------------------------------------------------+
 void RefreshContextFromAPI(void)
 {
+   static datetime lastApiCallTime = 0;
+   
+   // Rate limit protection - enforce minimum 500ms between calls
+   if(TimeCurrent() - lastApiCallTime < 1) 
+      Sleep(500);
+   
    string jsonRequest = BuildAnalysisRequest();
    
-   // Validate request
    if(StringLen(jsonRequest) == 0)
    {
-      Print("ERROR: Empty JSON request, skipping API call");
-      g_refreshManager.RecordApiFailure("Empty request data");
+      Print("ERROR: Empty JSON request");
+      g_refreshManager.RecordApiFailure("Empty request");
       return;
    }
    
    string headers;
    StringAdd(headers, "Content-Type: application/json\r\n");
+   StringAdd(headers, "Connection: close\r\n");  // Force new connection (prevents 1003)
    if(StringLen(InpApiKey) > 0)
       StringAdd(headers, "Authorization: Bearer " + InpApiKey + "\r\n");
    
    char data[], result[];
-   string url = InpApiUrl;
-   int res;
-   
-   // Convert to char array
    int strLen = StringToCharArray(jsonRequest, data);
+   if(strLen > 0) ArrayResize(data, strLen);
    
-   // === CRITICAL FIX: Remove null terminator that causes HTTP 422 ===
-   if(strLen > 0)
-      ArrayResize(data, strLen);
+   // Retry loop with exponential backoff
+   int maxRetries = 3;
+   int res = -1;
    
-   datetime callStart = TimeLocal();
-   res = WebRequest("POST", url, headers, InpApiTimeoutMs, data, result, headers);
+   for(int attempt = 0; attempt < maxRetries; attempt++)
+   {
+      res = WebRequest("POST", InpApiUrl, headers, InpApiTimeoutMs, data, result, headers);
+      
+      if(res == 200) break;  // Success
+      
+      if(res == 1003)  // Connection error - wait and retry
+      {
+         Print("API Warning: HTTP 1003 on attempt ", attempt + 1, ", retrying...");
+         Sleep(500 * (attempt + 1));  // 500ms, 1000ms, 1500ms
+         continue;
+      }
+      
+      // Other errors - fail immediately
+      break;
+   }
+   
+   lastApiCallTime = TimeCurrent();
    
    if(res != 200)
    {
       Print("API Error: HTTP ", res);
-      if(res == 422)
-         Print("JSON Sent: ", jsonRequest); // Debug info
       g_refreshManager.RecordApiFailure("HTTP " + IntegerToString(res));
       return;
    }
@@ -281,156 +216,161 @@ void RefreshContextFromAPI(void)
    
    g_state.volatilityRegime = json["regime"].ToStr();
    g_state.trendAlignment = json["trend_alignment"].ToDbl();
+   g_state.signalConfidence = json["confidence"].ToDbl();
+   g_state.entryPrecision = json["entry_precision"].ToDbl();
    
-   g_refreshManager.RecordApiSuccess((double)(TimeLocal() - callStart));
+   string signal = json["signal"].ToStr();
+   if(signal == "BUY") g_state.signalDirection = 1;
+   else if(signal == "SELL") g_state.signalDirection = -1;
+   else g_state.signalDirection = 0;
+   
+   g_refreshManager.RecordApiSuccess(0);
    g_state.lastContextUpdate = TimeCurrent();
+   g_state.lastSignalUpdate = TimeCurrent();
    
-   if(InpVerboseLogging)
-   {
-      Print("Context updated: Regime=", g_state.volatilityRegime, 
-            " TrendAlign=", DoubleToString(g_state.trendAlignment, 2));
-   }
+   Print("Context updated: Signal=", signal, " Regime=", g_state.volatilityRegime, 
+         " Conf=", DoubleToString(g_state.signalConfidence, 2));
 }
 
 //+------------------------------------------------------------------+
 void RefreshSignalFromAPI(void)
 {
-   if(StringLen(g_state.lastApiResponse) == 0)
-   {
+   // Context refresh already gets signal, just update timing
+   if(TimeCurrent() - g_state.lastSignalUpdate > 60)
       RefreshContextFromAPI();
-      return;
-   }
-   
-   CJAVal json;
-   if(!json.Deserialize(g_state.lastApiResponse))
-   {
-      RefreshContextFromAPI();
-      return;
-   }
-   
-   string signal = json["signal"].ToStr();
-   g_state.signalConfidence = json["confidence"].ToDbl();
-   g_state.entryPrecision = json["entry_precision"].ToDbl();
-   
-   if(signal == "BUY")
-      g_state.signalDirection = 1;
-   else if(signal == "SELL")
-      g_state.signalDirection = -1;
-   else
-      g_state.signalDirection = 0;
-   
-   g_state.lastSignalUpdate = TimeCurrent();
-   
-   if(InpVerboseLogging)
-   {
-      Print("Signal: ", signal, " Conf=", DoubleToString(g_state.signalConfidence, 2),
-            " Prec=", DoubleToString(g_state.entryPrecision, 2));
-   }
 }
 
 //+------------------------------------------------------------------+
-//| FIXED: Build Analysis Request with validation                      |
+//| Build Rolling Window JSON Request                                  |
 //+------------------------------------------------------------------+
 string BuildAnalysisRequest(void)
 {
-   MqlRates ratesM1[], ratesM5[], ratesM15[], ratesH1[], ratesD1[];
+   MqlRates ratesH1[], ratesM15[], ratesM5[], ratesM1[];
    
-   ArraySetAsSeries(ratesM1, true);
-   ArraySetAsSeries(ratesM5, true);
-   ArraySetAsSeries(ratesM15, true);
    ArraySetAsSeries(ratesH1, true);
-   ArraySetAsSeries(ratesD1, true);
+   ArraySetAsSeries(ratesM15, true);
+   ArraySetAsSeries(ratesM5, true);
+   ArraySetAsSeries(ratesM1, true);
    
-   // Copy rates with error checking
-   int copied1 = CopyRates(g_state.symbol, PERIOD_M1, 0, 10, ratesM1);
-   int copied5 = CopyRates(g_state.symbol, PERIOD_M5, 0, 10, ratesM5);
-   int copied15 = CopyRates(g_state.symbol, PERIOD_M15, 0, 10, ratesM15);
-   int copiedH1 = CopyRates(g_state.symbol, PERIOD_H1, 0, 10, ratesH1);
-   int copiedD1 = CopyRates(g_state.symbol, PERIOD_D1, 0, 10, ratesD1);
+   // CRITICAL FIX: Synchronize all timeframes to the same end time
+   // This ensures temporal alignment for the Python fusion engine
+   datetime end_time = TimeCurrent() - 1; // -1 sec to ensure complete candles
    
-   // Validate all timeframes have data
-   if(copied1 <= 0 || copied5 <= 0 || copied15 <= 0 || copiedH1 <= 0 || copiedD1 <= 0)
+   // Calculate start times so all windows cover the same time period
+   datetime startH1  = end_time - (InpContextWindowSize * PeriodSeconds(PERIOD_H1));
+   datetime startM15 = end_time - (InpContextWindowSize * PeriodSeconds(PERIOD_M15));
+   datetime startM5  = end_time - (InpExecutionWindowSize * PeriodSeconds(PERIOD_M5));
+   datetime startM1  = end_time - (InpExecutionWindowSize * PeriodSeconds(PERIOD_M1));
+   
+   // Copy synchronized rolling windows (aligned to end_time)
+   int copiedH1  = CopyRates(g_state.symbol, PERIOD_H1, startH1, InpContextWindowSize, ratesH1);
+   int copiedM15 = CopyRates(g_state.symbol, PERIOD_M15, startM15, InpContextWindowSize, ratesM15);
+   int copiedM5  = CopyRates(g_state.symbol, PERIOD_M5, startM5, InpExecutionWindowSize, ratesM5);
+   int copiedM1  = CopyRates(g_state.symbol, PERIOD_M1, startM1, InpExecutionWindowSize, ratesM1);
+   
+   // Validate
+   if(copiedH1 < InpContextWindowSize || copiedM15 < InpContextWindowSize ||
+      copiedM5 < InpExecutionWindowSize || copiedM1 < InpExecutionWindowSize)
    {
-      Print("ERROR: Failed to copy rates. M1:", copied1, " M5:", copied5, 
-            " M15:", copied15, " H1:", copiedH1, " D1:", copiedD1);
+      Print("ERROR: Insufficient history. H1:", copiedH1, " M15:", copiedM15, 
+            " M5:", copiedM5, " M1:", copiedM1);
       return "";
    }
    
-   // Build JSON
+   // Debug: Verify temporal alignment
+   Print("Time sync check - H1 newest:", TimeToString(ratesH1[0].time), 
+         " oldest:", TimeToString(ratesH1[copiedH1-1].time));
+   Print("Time sync check - M15 newest:", TimeToString(ratesM15[0].time), 
+         " oldest:", TimeToString(ratesM15[copiedM15-1].time));
+   Print("Time sync check - M5 newest:", TimeToString(ratesM5[0].time), 
+         " oldest:", TimeToString(ratesM5[copiedM5-1].time));
+   Print("Time sync check - M1 newest:", TimeToString(ratesM1[0].time), 
+         " oldest:", TimeToString(ratesM1[copiedM1-1].time));
+   
    string json = "{";
    json += "\"symbol\": \"" + g_state.symbol + "\",";
    json += "\"asset_class\": \"gold\",";
-   json += "\"timeframes\": {";
    
-   // M1
-   json += "\"M1\": {";
-   json += "\"open\": " + DoubleToString(ratesM1[0].open, g_state.profile.digits) + ",";
-   json += "\"high\": " + DoubleToString(ratesM1[0].high, g_state.profile.digits) + ",";
-   json += "\"low\": " + DoubleToString(ratesM1[0].low, g_state.profile.digits) + ",";
-   json += "\"close\": " + DoubleToString(ratesM1[0].close, g_state.profile.digits) + ",";
-   json += "\"tick_volume\": " + IntegerToString((int)ratesM1[0].tick_volume) + ",";
-   json += "\"real_volume\": " + IntegerToString((int)ratesM1[0].real_volume);
-   json += "},";
+   // Context Windows (Regime Detection)
+   json += "\"context_h1\": " + TimeframeWindowToJson(ratesH1, copiedH1) + ",";
+   json += "\"context_m15\": " + TimeframeWindowToJson(ratesM15, copiedM15) + ",";
    
-   // M5
-   json += "\"M5\": {";
-   json += "\"close\": " + DoubleToString(ratesM5[0].close, g_state.profile.digits) + ",";
-   json += "\"atr\": " + DoubleToString(CalculateATR(PERIOD_M5, 14), g_state.profile.digits);
-   json += "},";
+   // Execution Windows (Entry Precision)
+   json += "\"execution_m5\": " + TimeframeWindowToJson(ratesM5, copiedM5) + ",";
+   json += "\"execution_m1\": " + TimeframeWindowToJson(ratesM1, copiedM1) + ",";
    
-   // M15
-   json += "\"M15\": {";
-   json += "\"close\": " + DoubleToString(ratesM15[0].close, g_state.profile.digits) + ",";
-   json += "\"ema20\": " + DoubleToString(CalculateEMA(PERIOD_M15, 20), g_state.profile.digits);
-   json += "},";
-   
-   // H1
-   json += "\"H1\": {";
-   json += "\"close\": " + DoubleToString(ratesH1[0].close, g_state.profile.digits) + ",";
-   json += "\"ema50\": " + DoubleToString(CalculateEMA(PERIOD_H1, 50), g_state.profile.digits);
-   json += "},";
-   
-   // D1
-   json += "\"D1\": {";
-   json += "\"close\": " + DoubleToString(ratesD1[0].close, g_state.profile.digits) + ",";
-   json += "\"atr\": " + DoubleToString(CalculateATR(PERIOD_D1, 14), g_state.profile.digits);
-   json += "}";
-   
-   json += "},";
-   
-   // Account
+   // Account info
    json += "\"account\": {";
    json += "\"balance\": " + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + ",";
    json += "\"equity\": " + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2);
    json += "},";
    
-   // Spread
    json += "\"spread_pips\": " + DoubleToString(g_spreadManager.GetSpreadPips(), 1);
    json += "}";
+   
+   Print("JSON Length: ", StringLen(json));
+   Print("M15 candles count: ", copiedM15);
+   Print("M1 candles count: ", copiedM1);
    
    return json;
 }
 
 //+------------------------------------------------------------------+
+//| Convert MqlRates array to JSON window                              |
+//+------------------------------------------------------------------+
+string TimeframeWindowToJson(MqlRates &rates[], int count)
+{
+   string window = "{";
+   
+   // Calculate ATR from the window (simplified)
+   double atr = CalculateATRFromRates(rates, count);
+   window += "\"atr\": " + DoubleToString(atr, 5) + ",";
+   
+   // Add candles array
+   window += "\"candles\": [";
+   
+   for(int i = count - 1; i >= 0; i--) // Send oldest first (chronological)
+   {
+      if(i < count - 1) window += ",";
+      
+      window += "{";
+      window += "\"time\": " + IntegerToString((int)rates[i].time) + ",";
+      window += "\"open\": " + DoubleToString(rates[i].open, g_state.profile.digits) + ",";
+      window += "\"high\": " + DoubleToString(rates[i].high, g_state.profile.digits) + ",";
+      window += "\"low\": " + DoubleToString(rates[i].low, g_state.profile.digits) + ",";
+      window += "\"close\": " + DoubleToString(rates[i].close, g_state.profile.digits) + ",";
+      window += "\"tick_volume\": " + IntegerToString((int)rates[i].tick_volume) + ",";
+      window += "\"real_volume\": " + IntegerToString((int)rates[i].real_volume);
+      window += "}";
+   }
+   
+   window += "]}";
+   return window;
+}
+
+//+------------------------------------------------------------------+
+double CalculateATRFromRates(MqlRates &rates[], int count)
+{
+   if(count < 2) return 0;
+   double sum = 0;
+   for(int i = 1; i < count; i++)
+   {
+      double high_low = rates[i].high - rates[i].low;
+      double high_close = MathAbs(rates[i].high - rates[i-1].close);
+      double low_close = MathAbs(rates[i].low - rates[i-1].close);
+      sum += MathMax(high_low, MathMax(high_close, low_close));
+   }
+   return sum / (count - 1);
+}
+
+//+------------------------------------------------------------------+
 void ExecuteTradingLogic(void)
 {
-   if(g_state.signalConfidence < InpMinSignalConfidence)
-      return;
-   
-   if(g_state.entryPrecision < g_state.profile.entryPrecisionThreshold)
-      return;
-   
-   if(InpRequireTrendAlignment && g_state.trendAlignment < 0.6)
-      return;
-   
-   if(g_state.openPositions >= InpMaxPositions)
-      return;
-   
-   if(g_state.dailyTrades >= 15)
-      return;
-   
-   if(g_state.openPositions > 0 && g_state.pyramidCount >= g_state.profile.pyramidMaxTrades)
-      return;
+   if(g_state.signalConfidence < InpMinSignalConfidence) return;
+   if(g_state.entryPrecision < 0.5) return; // Minimum precision
+   if(InpRequireTrendAlignment && g_state.trendAlignment < 0.6) return;
+   if(g_state.openPositions >= InpMaxPositions) return;
+   if(g_state.dailyTrades >= 15) return;
    
    if(g_state.signalDirection == 1 && CanOpenLong())
       OpenPosition(ORDER_TYPE_BUY);
@@ -442,22 +382,14 @@ void ExecuteTradingLogic(void)
 void OpenPosition(ENUM_ORDER_TYPE orderType)
 {
    double lots = CalculateLotSize();
-   if(lots <= 0)
-   {
-      Print("Invalid lot size calculated");
-      return;
-   }
+   if(lots <= 0) return;
    
    double atr = CalculateATR(PERIOD_M5, 14);
    double slDistance = atr * g_state.profile.slMultiplier;
    double tpDistance = atr * g_state.profile.tpMultiplier;
    
    MqlTick tick;
-   if(!SymbolInfoTick(g_state.symbol, tick))
-   {
-      Print("Failed to get tick data");
-      return;
-   }
+   if(!SymbolInfoTick(g_state.symbol, tick)) return;
    
    double price = (orderType == ORDER_TYPE_BUY) ? tick.ask : tick.bid;
    double sl = (orderType == ORDER_TYPE_BUY) ? price - slDistance : price + slDistance;
@@ -467,27 +399,16 @@ void OpenPosition(ENUM_ORDER_TYPE orderType)
    sl = NormalizeDouble(MathRound(sl / tickSize) * tickSize, g_state.profile.digits);
    tp = NormalizeDouble(MathRound(tp / tickSize) * tickSize, g_state.profile.digits);
    
-   bool success = false;
-   if(orderType == ORDER_TYPE_BUY)
-      success = g_trade.Buy(lots, g_state.symbol, price, sl, tp);
-   else
-      success = g_trade.Sell(lots, g_state.symbol, price, sl, tp);
+   bool success = (orderType == ORDER_TYPE_BUY) ? 
+      g_trade.Buy(lots, g_state.symbol, price, sl, tp) :
+      g_trade.Sell(lots, g_state.symbol, price, sl, tp);
    
    if(success)
    {
       g_state.lastTradeTime = TimeCurrent();
       g_state.dailyTrades++;
       g_state.pyramidCount++;
-      
-      string dir = (orderType == ORDER_TYPE_BUY) ? "BUY" : "SELL";
-      Print("Opened ", dir, " | Lots: ", DoubleToString(lots, 2));
-      
-      SendNotification(StringFormat("GoldDiggr %s: %s %s lots", 
-         g_state.symbol, dir, DoubleToString(lots, 2)));
-   }
-   else
-   {
-      Print("Trade failed: ", GetLastError());
+      Print("Opened ", (orderType == ORDER_TYPE_BUY ? "BUY" : "SELL"), " | Lots: ", DoubleToString(lots, 2));
    }
 }
 
@@ -496,32 +417,23 @@ double CalculateLotSize(void)
 {
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double riskAmount = balance * InpRiskPercent / 100.0;
-   
-   if(g_state.openPositions > 0)
-      riskAmount *= InpPyramidLotMultiplier;
+   if(g_state.openPositions > 0) riskAmount *= 1.0; // No pyramid multiplier for now
    
    double atr = CalculateATR(PERIOD_M5, 14);
    double slDistance = atr * g_state.profile.slMultiplier;
-   
-   if(slDistance <= 0)
-      return 0;
+   if(slDistance <= 0) return 0;
    
    double tickValue = SymbolInfoDouble(g_state.symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSize = SymbolInfoDouble(g_state.symbol, SYMBOL_TRADE_TICK_SIZE);
-   
-   if(tickValue <= 0 || tickSize <= 0)
-      return 0;
+   if(tickValue <= 0 || tickSize <= 0) return 0;
    
    double lots = riskAmount / (slDistance * tickValue / tickSize);
-   
    double lotStep = SymbolInfoDouble(g_state.symbol, SYMBOL_VOLUME_STEP);
    double minLot = SymbolInfoDouble(g_state.symbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(g_state.symbol, SYMBOL_VOLUME_MAX);
    
    lots = MathFloor(lots / lotStep) * lotStep;
-   lots = MathMax(minLot, MathMin(maxLot, lots));
-   
-   return lots;
+   return MathMax(minLot, MathMin(maxLot, lots));
 }
 
 //+------------------------------------------------------------------+
@@ -529,43 +441,36 @@ void ManageOpenPositions(void)
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if(PositionGetSymbol(i) != g_state.symbol)
-         continue;
-      
-      if(PositionGetInteger(POSITION_MAGIC) != 42002)
-         continue;
+      if(PositionGetSymbol(i) != g_state.symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != 42002) continue;
       
       long posType = PositionGetInteger(POSITION_TYPE);
       double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       double currentSL = PositionGetDouble(POSITION_SL);
-      double currentTP = PositionGetDouble(POSITION_TP);
       
       MqlTick tick;
       SymbolInfoTick(g_state.symbol, tick);
       
       double atr = CalculateATR(PERIOD_M5, 14);
       double trailDistance = atr * 1.5;
-      
       double newSL = currentSL;
       
       if(posType == POSITION_TYPE_BUY)
       {
          double potentialSL = tick.bid - trailDistance;
-         if(potentialSL > openPrice && potentialSL > currentSL)
-            newSL = potentialSL;
+         if(potentialSL > openPrice && potentialSL > currentSL) newSL = potentialSL;
       }
       else
       {
          double potentialSL = tick.ask + trailDistance;
-         if(potentialSL < openPrice && potentialSL < currentSL)
-            newSL = potentialSL;
+         if(potentialSL < openPrice && potentialSL < currentSL) newSL = potentialSL;
       }
       
       if(newSL != currentSL)
       {
          double tickSize = SymbolInfoDouble(g_state.symbol, SYMBOL_TRADE_TICK_SIZE);
          newSL = NormalizeDouble(MathRound(newSL / tickSize) * tickSize, g_state.profile.digits);
-         g_trade.PositionModify(PositionGetInteger(POSITION_TICKET), newSL, currentTP);
+         g_trade.PositionModify(PositionGetInteger(POSITION_TICKET), newSL, PositionGetDouble(POSITION_TP));
       }
    }
 }
@@ -576,16 +481,12 @@ void UpdatePositionState(void)
    g_state.openPositions = 0;
    g_state.totalLots = 0;
    g_state.unrealizedPnL = 0;
-   
    double totalWeightedPrice = 0;
    
    for(int i = 0; i < PositionsTotal(); i++)
    {
-      if(PositionGetSymbol(i) != g_state.symbol)
-         continue;
-      
-      if(PositionGetInteger(POSITION_MAGIC) != 42002)
-         continue;
+      if(PositionGetSymbol(i) != g_state.symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != 42002) continue;
       
       g_state.openPositions++;
       double lots = PositionGetDouble(POSITION_VOLUME);
@@ -608,12 +509,10 @@ void UpdatePositionState(void)
 void CheckDailyReset(void)
 {
    datetime currentDay = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
-   
    if(currentDay != g_state.tradingDay)
    {
       Print("=== New Trading Day ===");
-      Print("Previous day PnL: ", DoubleToString(g_state.dailyPnL, 2));
-      
+      Print("Previous PnL: ", DoubleToString(g_state.dailyPnL, 2));
       g_state.dailyPnL = 0;
       g_state.dailyTrades = 0;
       g_state.tradingDay = currentDay;
@@ -625,23 +524,17 @@ bool CheckEquityProtection(void)
 {
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   
-   if(equity < balance * (1 - InpMaxDailyRisk / 100.0))
-      return true;
-   
-   return false;
+   return equity < balance * (1 - InpMaxDailyRisk / 100.0);
 }
 
 //+------------------------------------------------------------------+
 bool CanOpenLong(void)
 {
    for(int i = 0; i < PositionsTotal(); i++)
-   {
-      if(PositionGetSymbol(i) != g_state.symbol) continue;
-      if(PositionGetInteger(POSITION_MAGIC) != 42002) continue;
-      if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+      if(PositionGetSymbol(i) == g_state.symbol && 
+         PositionGetInteger(POSITION_MAGIC) == 42002 &&
+         PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
          return false;
-   }
    return true;
 }
 
@@ -649,12 +542,10 @@ bool CanOpenLong(void)
 bool CanOpenShort(void)
 {
    for(int i = 0; i < PositionsTotal(); i++)
-   {
-      if(PositionGetSymbol(i) != g_state.symbol) continue;
-      if(PositionGetInteger(POSITION_MAGIC) != 42002) continue;
-      if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+      if(PositionGetSymbol(i) == g_state.symbol && 
+         PositionGetInteger(POSITION_MAGIC) == 42002 &&
+         PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
          return false;
-   }
    return true;
 }
 
@@ -662,39 +553,15 @@ bool CanOpenShort(void)
 double CalculateATR(ENUM_TIMEFRAMES tf, int period)
 {
    int handle = iATR(g_state.symbol, tf, period);
-   if(handle == INVALID_HANDLE)
-      return 0;
-   
+   if(handle == INVALID_HANDLE) return 0;
    double atr[];
    ArraySetAsSeries(atr, true);
-   
    if(CopyBuffer(handle, 0, 0, 1, atr) < 1)
    {
       IndicatorRelease(handle);
       return 0;
    }
-   
    IndicatorRelease(handle);
    return atr[0];
-}
-
-//+------------------------------------------------------------------+
-double CalculateEMA(ENUM_TIMEFRAMES tf, int period)
-{
-   int handle = iMA(g_state.symbol, tf, period, 0, MODE_EMA, PRICE_CLOSE);
-   if(handle == INVALID_HANDLE)
-      return 0;
-   
-   double ema[];
-   ArraySetAsSeries(ema, true);
-   
-   if(CopyBuffer(handle, 0, 0, 1, ema) < 1)
-   {
-      IndicatorRelease(handle);
-      return 0;
-   }
-   
-   IndicatorRelease(handle);
-   return ema[0];
 }
 //+------------------------------------------------------------------+
